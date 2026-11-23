@@ -22,6 +22,7 @@
     settings: null,
     ruleGlobalDefaults: { comment_wait_seconds: 30, comment_merge_mode: 'pack' },
     logManage: null,
+    resendingIds: {},
     modalRule: null, // null | { idx, data, chats }
     modalPickerQuery: '',
     modalPassword: false,
@@ -455,7 +456,7 @@
                     <td style="white-space:nowrap">
                       ${
                         it.target_id && Number(it.target_id) !== 0
-                          ? `<button type="button" class="btn small" data-resend-log="${it.id}">重发</button>`
+                          ? `<button type="button" class="btn small" data-resend-log="${it.id}" ${state.resendingIds[it.id] ? 'disabled' : ''}>${state.resendingIds[it.id] ? '重发中...' : '重发'}</button>`
                           : '<span class="muted">-</span>'
                       }
                     </td>
@@ -1603,13 +1604,17 @@
     document.querySelectorAll('[data-resend-log]').forEach((b) => {
       b.onclick = async () => {
         const id = b.dataset.resendLog;
+        if (state.resendingIds[id]) return;
+        state.resendingIds[id] = true;
         b.disabled = true;
         b.textContent = '重发中...';
         try {
           await api(`/api/logs/${encodeURIComponent(id)}/resend`, { method: 'POST' });
+          delete state.resendingIds[id];
           toast('已重新发送到目标频道', 'success');
           await loadRouteData('/logs');
         } catch (err) {
+          delete state.resendingIds[id];
           toast(err.message, 'danger');
           b.disabled = false;
           b.textContent = '重发';

@@ -698,7 +698,7 @@ class AccountRunner:
                         detail=str(exc),
                     )
                     last_ok, last_msg = False, str(exc)
-                if target_override is None and self.manager.cfg.delay_seconds > 0:
+                if self.manager.cfg.delay_seconds > 0:
                     await asyncio.sleep(self.manager.cfg.delay_seconds)
             return last_ok, last_msg
 
@@ -1067,7 +1067,7 @@ class AccountRunner:
                         if ch:
                             any_changed = True
                 clean_preview = next((c for c in captions if c), "") or f"[相册 {len(main_msgs)} 项]"
-                return await self._deliver_album_to_target(
+                res = await self._deliver_album_to_target(
                     source_ent,
                     source_id,
                     source_title,
@@ -1083,6 +1083,9 @@ class AccountRunner:
                     clean_preview,
                     detail_note="手动重发",
                 )
+                if self.manager.cfg.delay_seconds > 0:
+                    await asyncio.sleep(self.manager.cfg.delay_seconds)
+                return res
 
             msg = main_msgs[0]
             raw_text = msg.message or ""
@@ -1093,7 +1096,7 @@ class AccountRunner:
                 cleaned_text, cleaned_entities, changed = "", None, bool(raw_text)
             else:
                 cleaned_text, cleaned_entities, changed = clean_message_text(raw_text, orig_entities, rule)
-            return await self._deliver_single_to_target(
+            res = await self._deliver_single_to_target(
                 source_ent,
                 source_id,
                 source_title,
@@ -1109,6 +1112,9 @@ class AccountRunner:
                 has_real_media,
                 detail_note="手动重发",
             )
+            if self.manager.cfg.delay_seconds > 0:
+                await asyncio.sleep(self.manager.cfg.delay_seconds)
+            return res
 
     async def process_single(self, event: events.NewMessage.Event) -> None:
         if not self.enabled:
