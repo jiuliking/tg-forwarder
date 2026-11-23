@@ -1,0 +1,762 @@
+import asyncio
+import base64
+import hashlib
+import io
+import logging
+import os
+import secrets
+from pathlib import Path
+from typing import Any
+
+import qrcode
+from aiohttp import web
+from telethon import utils
+from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError
+
+from common import (
+    AuthStore,
+    clean_message_text,
+    compile_rule_dict,
+    load_raw_config,
+    resolve_tg_api,
+    save_raw_config,
+    session_prefix_for,
+    should_skip_text,
+    should_strip_all_text,
+)
+
+log = logging.getLogger("tg-forwarder.web")
+
+SESSION_COOKIE = "tg_fwd_session"
+
+
+class WebConsole:
+    def __init__(self, manager: Any, auth: AuthStore, config_path: Path, session_dir: Path, ui_dir: Path) -> None:
+        self.manager = manager
+        self.auth = auth
+        self.config_path = config_path
+        self.session_dir = session_dir
+        self.ui_dir = ui_dir
+
+        self._qr_objs: dict[str, Any] = {}
+        self._qr_tasks: dict[str, asyncio.Task[None]] = {}
+        self._qr_states: dict[str, dict[str, Any]] = {}
+        self._phone_states: dict[str, tuple[str, str]] = {}
+
+    def _is_authed(self, request: web.Request) -> bool:
+        sess = request.cookies.get(SESSION_COOKIE, "")
+        if self.auth.verify_session(sess):
+            return True
+        auth_hdr = request.headers.get("Authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            tok = auth_hdr[7:].strip()
+            if self.auth.verify_access_token(tok):
+                return True
+        return False
+
+    @web.middleware
+    async def auth_middleware(self, request: web.Request, handler):
+        path = request.path
+        if path.startswith("/api/"):
+            public_api = {"/api/auth/status", "/api/auth/login", "/api/auth/logout", "/api/healthz"}
+            if path not in public_api and not self._is_authed(request):
+                return web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(request)
+
+    def _asset_version(self, filename: str) -> str:
+        p = self.ui_dir / filename
+        try:
+            return hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+        except OSError:
+            return "0"
+
+    async def handle_index(self, request: web.Request) -> web.StreamResponse:
+        tok = request.query.get("token", "")
+        if tok and self.auth.verify_access_token(tok):
+            sess = self.auth.create_session()
+            resp = web.HTTPFound("/")
+            resp.set_cookie(
+                SESSION_COOKIE,
+                sess,
+                max_age=self.auth.SESSION_TTL,
+                httponly=True,
+                samesite="Lax",
+                path="/",
+            )
+            raise resp
+        html = (self.ui_dir / "index.html").read_text(encoding="utf-8")
+        css_v = self._asset_version("styles.css")
+        js_v = self._asset_version("app.js")
+        html = html.replace("/assets/styles.css", f"/assets/styles.css?v={css_v}")
+        html = html.replace("/assets/app.js", f"/assets/app.js?v={js_v}")
+        return web.Response(
+            text=html,
+            content_type="text/html",
+            charset="utf-8",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+            },
+        )
+
+    async def handle_healthz(self, _request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    async def handle_auth_status(self, request: web.Request) -> web.Response:
+        return web.json_response({"authenticated": self._is_authed(request)})
+
+    async def handle_login(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        password = str(data.get("password") or "")
+        token = str(data.get("token") or "")
+        ok = False
+        if password:
+            ok = self.auth.verify_password(password)
+        elif token:
+            ok = self.auth.verify_access_token(token)
+        if not ok:
+            return web.json_response({"error": "密码或访问 Token 不正确"}, status=401)
+        sess = self.auth.create_session()
+        resp = web.json_response({"ok": True})
+        resp.set_cookie(
+            SESSION_COOKIE,
+            sess,
+            max_age=self.auth.SESSION_TTL,
+            httponly=True,
+            samesite="Lax",
+            path="/",
+        )
+        return resp
+
+    async def handle_logout(self, request: web.Request) -> web.Response:
+        sess = request.cookies.get(SESSION_COOKIE, "")
+        self.auth.delete_session(sess)
+        resp = web.json_response({"ok": True})
+        resp.del_cookie(SESSION_COOKIE, path="/")
+        return resp
+
+    async def handle_change_password(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        cur = str(data.get("current_password") or "")
+        new_p = str(data.get("new_password") or "")
+        if len(new_p) < 8:
+            return web.json_response({"error": "新密码至少需要 8 位字符"}, status=400)
+        if not self.auth.change_password(cur, new_p):
+            return web.json_response({"error": "当前密码不正确"}, status=400)
+        return web.json_response({ "ok": True })
+
+    async def _runner_summary(self, acct_dict: dict[str, Any], rules: list[dict[str, Any]]) -> dict[str, Any]:
+        acct_id = str(acct_dict["id"])
+        runner = self.manager.get_runner(acct_id)
+        authorized = False
+        listening = False
+        me_info = None
+        if runner and acct_dict.get("enabled", True):
+            try:
+                if not runner.client.is_connected():
+                    await runner.client.connect()
+                authorized = await runner.client.is_user_authorized()
+                listening = runner.listening
+                if authorized:
+                    me = await runner.client.get_me()
+                    phone = getattr(me, "phone", None) or ""
+                    masked = (phone[:3] + "****" + phone[-4:]) if len(phone) >= 7 else ("已绑定" if phone else "")
+                    me_info = {
+                        "id": me.id,
+                        "name": " ".join(p for p in [me.first_name, me.last_name] if p) or str(me.id),
+                        "username": me.username or "",
+                        "phone": masked,
+                    }
+            except Exception as exc:
+                log.warning("Failed to inspect account %s: %s", acct_id, exc)
+        rules_count = sum(1 for r in rules if (r.get("account_id") or "default") == acct_id)
+        qr_st = self._qr_states.get(acct_id) or {"status": "idle", "error": ""}
+        return {
+            "id": acct_id,
+            "name": acct_dict.get("name") or acct_id,
+            "enabled": bool(acct_dict.get("enabled", True)),
+            "authorized": authorized,
+            "listening": listening,
+            "me": me_info,
+            "rules_count": rules_count,
+            "qr": {"status": qr_st.get("status", "idle"), "error": qr_st.get("error", "")},
+        }
+
+    async def _all_accounts_summary(self) -> list[dict[str, Any]]:
+        raw = load_raw_config(self.config_path)
+        rules = raw.get("rules") or []
+        return [await self._runner_summary(a, rules) for a in (raw.get("accounts") or [])]
+
+    async def handle_accounts_list(self, _request: web.Request) -> web.Response:
+        return web.json_response({"items": await self._all_accounts_summary()})
+
+    async def handle_account_create(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        name = str(data.get("name") or "").strip()
+        if not name:
+            return web.json_response({"error": "请填写账号名称"}, status=400)
+        raw = load_raw_config(self.config_path)
+        acct_id = "acct_" + secrets.token_hex(3)
+        raw["accounts"].append({"id": acct_id, "name": name, "enabled": True})
+        save_raw_config(self.config_path, raw)
+        await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "id": acct_id, "items": await self._all_accounts_summary()})
+
+    async def handle_account_update(self, request: web.Request) -> web.Response:
+        acct_id = request.match_info["acct_id"]
+        data = await request.json()
+        raw = load_raw_config(self.config_path)
+        found = None
+        for a in raw["accounts"]:
+            if a["id"] == acct_id:
+                found = a
+                break
+        if not found:
+            return web.json_response({"error": "账号不存在"}, status=404)
+        if "name" in data and str(data["name"]).strip():
+            found["name"] = str(data["name"]).strip()
+        if "enabled" in data:
+            found["enabled"] = bool(data["enabled"])
+        save_raw_config(self.config_path, raw)
+        await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "items": await self._all_accounts_summary()})
+
+    async def handle_account_delete(self, request: web.Request) -> web.Response:
+        acct_id = request.match_info["acct_id"]
+        raw = load_raw_config(self.config_path)
+        if len(raw["accounts"]) <= 1:
+            return web.json_response({"error": "至少需保留 1 个账号"}, status=400)
+        new_accts = [a for a in raw["accounts"] if a["id"] != acct_id]
+        if len(new_accts) == len(raw["accounts"]):
+            return web.json_response({"error": "账号不存在"}, status=404)
+        if any((r.get("account_id") or "default") == acct_id for r in (raw.get("rules") or [])):
+            return web.json_response({"error": "还有规则绑定在这个账号上，请先删除或改绑规则"}, status=400)
+
+        task = self._qr_tasks.pop(acct_id, None)
+        if task and not task.done():
+            task.cancel()
+        runner = self.manager.get_runner(acct_id)
+        if runner:
+            try:
+                if await runner.client.is_user_authorized():
+                    await runner.client.log_out()
+            except Exception:
+                pass
+            await runner.stop()
+
+        prefix = session_prefix_for(self.session_dir, acct_id)
+        for suffix in (".session", ".session-journal"):
+            Path(f"{prefix}{suffix}").unlink(missing_ok=True)
+
+        raw["accounts"] = new_accts
+        save_raw_config(self.config_path, raw)
+        await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "items": await self._all_accounts_summary()})
+
+    async def handle_overview(self, _request: web.Request) -> web.Response:
+        raw = load_raw_config(self.config_path)
+        rules = raw.get("rules") or []
+        enabled_rules = [r for r in rules if r.get("enabled", True)]
+        accounts = await self._all_accounts_summary()
+        acct_name_map = {a["id"]: a["name"] for a in accounts}
+
+        stats = self.manager.history.stats_and_activity()
+        recent = self.manager.history.recent(limit=8)
+
+        unique_sources = set()
+        unique_targets = set()
+        for r in enabled_rules:
+            for s in r.get("sources") or []:
+                unique_sources.add(str(s))
+            for t in r.get("targets") or []:
+                unique_targets.add(str(t))
+
+        resolved_sources = sum(len(r.source_map) for r in self.manager.runners.values())
+        authorized_accounts = sum(1 for a in accounts if a["authorized"])
+        listening_accounts = sum(1 for a in accounts if a["listening"])
+
+        return web.json_response(
+            {
+                "accounts": accounts,
+                "accounts_total": len(accounts),
+                "accounts_authorized": authorized_accounts,
+                "accounts_listening": listening_accounts,
+                "telegram": {
+                    "authorized": authorized_accounts > 0,
+                    "listening": listening_accounts > 0,
+                    "me": next((a["me"] for a in accounts if a["me"]), None),
+                },
+                "rules_total": len(rules),
+                "rules_enabled": len(enabled_rules),
+                "sources_count": len(unique_sources),
+                "targets_count": len(unique_targets),
+                "resolved_sources": resolved_sources,
+                "enabled_rules_preview": [
+                    {
+                        "name": r.get("name") or "未命名规则",
+                        "account_id": r.get("account_id") or "default",
+                        "account_name": acct_name_map.get(r.get("account_id") or "default", r.get("account_id") or "default"),
+                        "sources": r.get("sources") or [],
+                        "targets": r.get("targets") or [],
+                        "drop_author": bool(r.get("drop_author", True)),
+                        "strip_all_text": bool(r.get("strip_all_text", False)),
+                        "fallback_reupload": bool(r.get("fallback_reupload", True)),
+                        "filters_count": len(r.get("skip_patterns") or [])
+                        + len(r.get("strip_patterns") or [])
+                        + len(r.get("replace_patterns") or []),
+                    }
+                    for r in enabled_rules[:6]
+                ],
+                "stats": stats,
+                "recent": recent,
+                "chat_titles": self.manager.all_chat_titles(),
+            }
+        )
+
+    async def handle_logs(self, request: web.Request) -> web.Response:
+        limit = int(request.query.get("limit", "100"))
+        status = request.query.get("status", "").strip()
+        rule = request.query.get("rule", "").strip()
+        account_id = request.query.get("account_id", "").strip()
+        rows = self.manager.history.recent(limit=limit, status=status, rule=rule, account_id=account_id)
+        raw = load_raw_config(self.config_path)
+        rule_names = [str(r.get("name") or f"rule-{i+1}") for i, r in enumerate(raw.get("rules") or [])]
+        accounts = [{"id": a["id"], "name": a["name"]} for a in (raw.get("accounts") or [])]
+        return web.json_response({"items": rows, "rules": rule_names, "accounts": accounts})
+
+    async def handle_rules_list(self, _request: web.Request) -> web.Response:
+        raw = load_raw_config(self.config_path)
+        accounts = [{"id": a["id"], "name": a["name"], "enabled": bool(a.get("enabled", True))} for a in (raw.get("accounts") or [])]
+        return web.json_response(
+            {
+                "rules": raw.get("rules") or [],
+                "accounts": accounts,
+                "chat_titles": self.manager.all_chat_titles(),
+            }
+        )
+
+    @staticmethod
+    def _sanitize_rule_payload(data: dict[str, Any], default_acct: str = "default") -> dict[str, Any]:
+        def _clean_peers(items: Any) -> list[int | str]:
+            out: list[int | str] = []
+            for item in items or []:
+                s = str(item).strip()
+                if not s:
+                    continue
+                try:
+                    out.append(int(s))
+                except ValueError:
+                    out.append(s)
+            return out
+
+        def _clean_patterns(items: Any) -> list[str]:
+            return [str(x) for x in (items or []) if str(x).strip()]
+
+        replaces = []
+        for rep in data.get("replace_patterns") or []:
+            pat = str(rep.get("pattern") or "").strip()
+            if pat:
+                replaces.append({"pattern": pat, "repl": str(rep.get("repl") or "")})
+
+        return {
+            "name": str(data.get("name") or "").strip() or "未命名规则",
+            "enabled": bool(data.get("enabled", True)),
+            "account_id": str(data.get("account_id") or default_acct).strip() or default_acct,
+            "sources": _clean_peers(data.get("sources")),
+            "targets": _clean_peers(data.get("targets")),
+            "drop_author": bool(data.get("drop_author", True)),
+            "fallback_reupload": bool(data.get("fallback_reupload", True)),
+            "strip_all_text": bool(data.get("strip_all_text", False)),
+            "skip_empty_text_only": bool(data.get("skip_empty_text_only", True)),
+            "disable_link_preview": bool(data.get("disable_link_preview", False)),
+            "skip_patterns": _clean_patterns(data.get("skip_patterns")),
+            "strip_text_patterns": _clean_patterns(data.get("strip_text_patterns")),
+            "strip_patterns": _clean_patterns(data.get("strip_patterns")),
+            "replace_patterns": replaces,
+        }
+
+    async def handle_rule_create(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        raw = load_raw_config(self.config_path)
+        default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
+        rule = self._sanitize_rule_payload(data, default_acct)
+        raw["rules"].append(rule)
+        try:
+            save_raw_config(self.config_path, raw)
+        except ValueError as exc:
+            return web.json_response({"error": f"正则表达式有误: {exc}"}, status=400)
+        await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "rules": raw["rules"]})
+
+    async def handle_rule_update(self, request: web.Request) -> web.Response:
+        idx = int(request.match_info["idx"])
+        data = await request.json()
+        raw = load_raw_config(self.config_path)
+        if idx < 0 or idx >= len(raw["rules"]):
+            return web.json_response({"error": "规则不存在"}, status=404)
+        default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
+        raw["rules"][idx] = self._sanitize_rule_payload(data, default_acct)
+        try:
+            save_raw_config(self.config_path, raw)
+        except ValueError as exc:
+            return web.json_response({"error": f"正则表达式有误: {exc}"}, status=400)
+        await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "rules": raw["rules"]})
+
+    async def handle_rule_delete(self, request: web.Request) -> web.Response:
+        idx = int(request.match_info["idx"])
+        raw = load_raw_config(self.config_path)
+        if idx < 0 or idx >= len(raw["rules"]):
+            return web.json_response({"error": "规则不存在"}, status=404)
+        raw["rules"].pop(idx)
+        save_raw_config(self.config_path, raw)
+        await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "rules": raw["rules"]})
+
+    async def handle_rule_toggle(self, request: web.Request) -> web.Response:
+        idx = int(request.match_info["idx"])
+        raw = load_raw_config(self.config_path)
+        if idx < 0 or idx >= len(raw["rules"]):
+            return web.json_response({"error": "规则不存在"}, status=404)
+        raw["rules"][idx]["enabled"] = not bool(raw["rules"][idx].get("enabled", True))
+        save_raw_config(self.config_path, raw)
+        await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "enabled": raw["rules"][idx]["enabled"]})
+
+    async def handle_rule_test(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        sample = str(data.get("text") or "")
+        strip_all_text = bool(data.get("strip_all_text", False))
+        try:
+            compiled = compile_rule_dict(
+                {
+                    "name": "preview",
+                    "strip_all_text": strip_all_text,
+                    "skip_patterns": data.get("skip_patterns") or [],
+                    "strip_text_patterns": data.get("strip_text_patterns") or [],
+                    "strip_patterns": data.get("strip_patterns") or [],
+                    "replace_patterns": data.get("replace_patterns") or [],
+                }
+            )
+        except ValueError as exc:
+            return web.json_response({"error": f"正则表达式错误: {exc}"}, status=400)
+        skip_reason = should_skip_text(sample, compiled)
+        strip_all_hit = should_strip_all_text(sample, compiled)
+        if strip_all_text or strip_all_hit is not None:
+            return web.json_response(
+                {
+                    "skipped": skip_reason is not None,
+                    "skip_reason": skip_reason or "",
+                    "cleared_all_text": True,
+                    "clear_reason": strip_all_hit or "规则已勾选去除全部文本",
+                    "cleaned": "",
+                    "changed": bool(sample),
+                }
+            )
+        cleaned, _, changed = clean_message_text(sample, None, compiled)
+        return web.json_response(
+            {
+                "skipped": skip_reason is not None,
+                "skip_reason": skip_reason or "",
+                "cleaned": cleaned,
+                "changed": changed,
+            }
+        )
+
+    async def handle_settings_get(self, _request: web.Request) -> web.Response:
+        raw = load_raw_config(self.config_path)
+        g = raw.get("global") or {}
+        api_id, api_hash, is_custom = resolve_tg_api(raw)
+        masked_hash = (
+            (api_hash[:4] + "****" + api_hash[-4:])
+            if len(api_hash) >= 10
+            else ("已配置" if api_hash else "")
+        )
+        return web.json_response(
+            {
+                "delay_seconds": float(g.get("delay_seconds", 1.0)),
+                "max_download_mb": int(g.get("max_download_mb", 2000)),
+                "dedup_ttl_hours": int(g.get("dedup_ttl_hours", 48)),
+                "temp_dir": str(g.get("temp_dir") or (self.config_path.resolve().parent / "cache")),
+                "api_id": api_id,
+                "api_hash_masked": masked_hash,
+                "api_custom": is_custom,
+                "access_token": self.auth.get_access_token(),
+            }
+        )
+
+    async def handle_settings_put(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        raw = load_raw_config(self.config_path)
+        g = raw.setdefault("global", {})
+
+        if "delay_seconds" in data:
+            g["delay_seconds"] = max(0.0, float(data.get("delay_seconds", 1.0)))
+        if "max_download_mb" in data:
+            g["max_download_mb"] = max(1, int(data.get("max_download_mb", 2000)))
+        if "dedup_ttl_hours" in data:
+            g["dedup_ttl_hours"] = max(1, int(data.get("dedup_ttl_hours", 48)))
+
+        if data.get("reset_api"):
+            g.pop("api_id", None)
+            g.pop("api_hash", None)
+        else:
+            if "api_id" in data and str(data["api_id"]).strip():
+                try:
+                    aid = int(str(data["api_id"]).strip())
+                    if aid <= 0:
+                        raise ValueError("API ID 必须为正整数")
+                    g["api_id"] = aid
+                except ValueError:
+                    return web.json_response({"error": "API ID 必须是正整数"}, status=400)
+            if "api_hash" in data and str(data["api_hash"]).strip():
+                ah = str(data["api_hash"]).strip()
+                if len(ah) < 16:
+                    return web.json_response({"error": "API Hash 格式看起来过短，请核对"}, status=400)
+                g["api_hash"] = ah
+
+        save_raw_config(self.config_path, raw)
+        await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True})
+
+    async def handle_token_rotate(self, _request: web.Request) -> web.Response:
+        tok = self.auth.rotate_access_token()
+        return web.json_response({"access_token": tok})
+
+    def _resolve_runner_or_404(self, acct_id: str) -> Any:
+        runner = self.manager.get_runner(acct_id)
+        if not runner:
+            raise web.HTTPNotFound(text='{"error":"账号不存在或未启用"}', content_type="application/json")
+        return runner
+
+    async def handle_tg_status(self, request: web.Request) -> web.Response:
+        acct_id = request.query.get("account_id", "default").strip() or "default"
+        raw = load_raw_config(self.config_path)
+        acct = next((a for a in raw["accounts"] if a["id"] == acct_id), None)
+        if not acct:
+            return web.json_response({"error": "账号不存在"}, status=404)
+        return web.json_response(await self._runner_summary(acct, raw.get("rules") or []))
+
+    @staticmethod
+    def _qr_to_data_url(url: str) -> str:
+        qr = qrcode.QRCode(border=2, box_size=8)
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="#121418", back_color="#ffffff")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+    async def _run_qr_waiter(self, acct_id: str, runner: Any, qr_obj: Any) -> None:
+        try:
+            await qr_obj.wait(timeout=60)
+            if runner.session_file.exists():
+                os.chmod(runner.session_file, 0o600)
+            self._qr_states[acct_id] = {"status": "authorized", "qr_data_url": "", "error": ""}
+            await runner.on_user_authorized()
+        except asyncio.TimeoutError:
+            self._qr_states[acct_id] = {"status": "expired", "qr_data_url": "", "error": "二维码已过期，请点击刷新"}
+        except SessionPasswordNeededError:
+            self._qr_states[acct_id] = {"status": "need_2fa", "qr_data_url": "", "error": ""}
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._qr_states[acct_id] = {"status": "error", "qr_data_url": "", "error": str(exc)}
+
+    async def handle_tg_qr_start(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        acct_id = str(body.get("account_id") or request.query.get("account_id") or "default").strip() or "default"
+        runner = self._resolve_runner_or_404(acct_id)
+        if not runner.client.is_connected():
+            await runner.client.connect()
+        if await runner.client.is_user_authorized():
+            return web.json_response({"status": "authorized"})
+        old_task = self._qr_tasks.get(acct_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        qr_obj = await runner.client.qr_login()
+        self._qr_objs[acct_id] = qr_obj
+        data_url = self._qr_to_data_url(qr_obj.url)
+        st = {"status": "waiting", "qr_data_url": data_url, "error": ""}
+        self._qr_states[acct_id] = st
+        self._qr_tasks[acct_id] = asyncio.create_task(self._run_qr_waiter(acct_id, runner, qr_obj))
+        return web.json_response(st)
+
+    async def handle_tg_qr_poll(self, request: web.Request) -> web.Response:
+        acct_id = request.query.get("account_id", "default").strip() or "default"
+        runner = self._resolve_runner_or_404(acct_id)
+        if await runner.client.is_user_authorized():
+            if not runner.listening:
+                await runner.on_user_authorized()
+            return web.json_response({"status": "authorized", "error": ""})
+        st = self._qr_states.get(acct_id) or {"status": "idle", "error": ""}
+        return web.json_response({"status": st.get("status", "idle"), "error": st.get("error", "")})
+
+    async def handle_tg_qr_2fa(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        acct_id = str(data.get("account_id") or "default").strip() or "default"
+        pwd = str(data.get("password") or "")
+        runner = self._resolve_runner_or_404(acct_id)
+        if not pwd:
+            return web.json_response({"error": "请输入两步验证密码"}, status=400)
+        try:
+            await runner.client.sign_in(password=pwd)
+            if runner.session_file.exists():
+                os.chmod(runner.session_file, 0o600)
+            self._qr_states[acct_id] = {"status": "authorized", "qr_data_url": "", "error": ""}
+            await runner.on_user_authorized()
+            return web.json_response({"status": "authorized"})
+        except Exception as exc:
+            return web.json_response({"error": f"两步验证失败: {exc}"}, status=400)
+
+    async def handle_tg_phone_send(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        acct_id = str(data.get("account_id") or "default").strip() or "default"
+        phone = str(data.get("phone") or "").strip()
+        runner = self._resolve_runner_or_404(acct_id)
+        if not phone:
+            return web.json_response({"error": "请填写带国际区号的手机号（如 +86...）"}, status=400)
+        if not runner.client.is_connected():
+            await runner.client.connect()
+        try:
+            res = await runner.client.send_code_request(phone)
+            self._phone_states[acct_id] = (phone, res.phone_code_hash)
+            return web.json_response({"ok": True})
+        except Exception as exc:
+            return web.json_response({"error": f"发送验证码失败: {exc}"}, status=400)
+
+    async def handle_tg_phone_verify(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        acct_id = str(data.get("account_id") or "default").strip() or "default"
+        code = str(data.get("code") or "").strip()
+        password = str(data.get("password") or "")
+        runner = self._resolve_runner_or_404(acct_id)
+        phone_state = self._phone_states.get(acct_id)
+        if not phone_state:
+            return web.json_response({"error": "请先发送验证码"}, status=400)
+        phone, phone_code_hash = phone_state
+        try:
+            try:
+                await runner.client.sign_in(
+                    phone=phone,
+                    code=code,
+                    phone_code_hash=phone_code_hash,
+                )
+            except SessionPasswordNeededError:
+                if not password:
+                    return web.json_response({"need_2fa": True, "error": "该账号启用了两步验证，请输入 2FA 密码"}, status=200)
+                await runner.client.sign_in(password=password)
+            if runner.session_file.exists():
+                os.chmod(runner.session_file, 0o600)
+            await runner.on_user_authorized()
+            return web.json_response({"ok": True, "status": "authorized"})
+        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as exc:
+            return web.json_response({"error": f"验证码无效或已过期: {exc}"}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"登录失败: {exc}"}, status=400)
+
+    async def handle_tg_logout(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        acct_id = str(body.get("account_id") or request.query.get("account_id") or "default").strip() or "default"
+        runner = self._resolve_runner_or_404(acct_id)
+        task = self._qr_tasks.pop(acct_id, None)
+        if task and not task.done():
+            task.cancel()
+        try:
+            if await runner.client.is_user_authorized():
+                await runner.client.log_out()
+        except Exception as exc:
+            log.warning("Logout warning for %s: %s", acct_id, exc)
+        runner.listening = False
+        runner.chats_cache = []
+        self._qr_states[acct_id] = {"status": "idle", "qr_data_url": "", "error": ""}
+        return web.json_response({"ok": True})
+
+    async def handle_chats(self, request: web.Request) -> web.Response:
+        acct_id = request.query.get("account_id", "").strip()
+        raw = load_raw_config(self.config_path)
+        if not acct_id and raw.get("accounts"):
+            acct_id = raw["accounts"][0]["id"]
+        runner = self.manager.get_runner(acct_id)
+        if not runner or not runner.enabled:
+            return web.json_response({"authorized": False, "account_id": acct_id, "items": []})
+        if not runner.client.is_connected():
+            await runner.client.connect()
+        if not await runner.client.is_user_authorized():
+            return web.json_response({"authorized": False, "account_id": acct_id, "items": []})
+
+        refresh = request.query.get("refresh", "0") == "1"
+        if refresh or not runner.chats_cache:
+            items: list[dict[str, Any]] = []
+            async for d in runner.client.iter_dialogs():
+                if not (d.is_channel or d.is_group):
+                    continue
+                ent = d.entity
+                if getattr(ent, "deactivated", False) or getattr(ent, "migrated_to", None):
+                    continue
+                pid = utils.get_peer_id(ent)
+                kind = "channel" if getattr(ent, "broadcast", False) else ("supergroup" if d.is_channel else "group")
+                nofwd = bool(getattr(ent, "noforwards", False))
+                uname = getattr(ent, "username", None) or ""
+                runner.chat_titles[pid] = d.name
+                items.append(
+                    {
+                        "id": pid,
+                        "title": d.name,
+                        "username": uname,
+                        "kind": kind,
+                        "noforwards": nofwd,
+                    }
+                )
+            runner.chats_cache = items
+        return web.json_response({"authorized": True, "account_id": acct_id, "items": runner.chats_cache})
+
+    async def _on_response_prepare(self, request: web.Request, response: web.StreamResponse) -> None:
+        if request.path.startswith("/assets/") and "Cache-Control" not in response.headers:
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+
+    def build_app(self) -> web.Application:
+        app = web.Application(middlewares=[self.auth_middleware])
+        app.on_response_prepare.append(self._on_response_prepare)
+        app.router.add_get("/", self.handle_index)
+        app.router.add_get("/api/healthz", self.handle_healthz)
+        app.router.add_get("/api/auth/status", self.handle_auth_status)
+        app.router.add_post("/api/auth/login", self.handle_login)
+        app.router.add_post("/api/auth/logout", self.handle_logout)
+        app.router.add_post("/api/auth/password", self.handle_change_password)
+
+        app.router.add_get("/api/overview", self.handle_overview)
+        app.router.add_get("/api/logs", self.handle_logs)
+        app.router.add_get("/api/rules", self.handle_rules_list)
+        app.router.add_post("/api/rules", self.handle_rule_create)
+        app.router.add_put("/api/rules/{idx}", self.handle_rule_update)
+        app.router.add_delete("/api/rules/{idx}", self.handle_rule_delete)
+        app.router.add_post("/api/rules/{idx}/toggle", self.handle_rule_toggle)
+        app.router.add_post("/api/rules/test", self.handle_rule_test)
+
+        app.router.add_get("/api/settings", self.handle_settings_get)
+        app.router.add_put("/api/settings", self.handle_settings_put)
+        app.router.add_post("/api/settings/token/rotate", self.handle_token_rotate)
+
+        app.router.add_get("/api/accounts", self.handle_accounts_list)
+        app.router.add_post("/api/accounts", self.handle_account_create)
+        app.router.add_put("/api/accounts/{acct_id}", self.handle_account_update)
+        app.router.add_delete("/api/accounts/{acct_id}", self.handle_account_delete)
+
+        app.router.add_get("/api/tg/status", self.handle_tg_status)
+        app.router.add_post("/api/tg/qr/start", self.handle_tg_qr_start)
+        app.router.add_get("/api/tg/qr/poll", self.handle_tg_qr_poll)
+        app.router.add_post("/api/tg/qr/2fa", self.handle_tg_qr_2fa)
+        app.router.add_post("/api/tg/phone/send_code", self.handle_tg_phone_send)
+        app.router.add_post("/api/tg/phone/verify", self.handle_tg_phone_verify)
+        app.router.add_post("/api/tg/logout", self.handle_tg_logout)
+
+        app.router.add_get("/api/chats", self.handle_chats)
+        app.router.add_static("/assets/", self.ui_dir)
+        return app

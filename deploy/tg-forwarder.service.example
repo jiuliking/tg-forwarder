@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Channel Forwarder (Telethon UserBot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tg-forwarder
+ExecStart=/opt/tg-forwarder/.venv/bin/python /opt/tg-forwarder/forwarder.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+global:
+  delay_seconds: 1.0
+  max_download_mb: 2000
+  dedup_ttl_hours: 48
+  # Optional: override .env Telegram API credentials from Web UI or here
+  # api_id: 12345678
+  # api_hash: "0123456789abcdef0123456789abcdef"
+
+accounts:
+  - id: default
+    name: 主账号
+    enabled: true
+
+rules:
+  - name: 示例搬运规则
+    enabled: false
+    account_id: default
+    sources:
+      - -1001234567890
+    targets:
+      - -1009876543210
+    drop_author: true
+    fallback_reupload: true
+    strip_all_text: false
+    skip_empty_text_only: true
+    disable_link_preview: false
+    skip_patterns:
+      - "(?i)#sponsored|广告推广"
+    strip_text_patterns: []
+    strip_patterns:
+      - "(?m)^.*关注备用频道.*$"
+    replace_patterns:
+      - pattern: "@old_channel"
+        repl: "@my_channel"

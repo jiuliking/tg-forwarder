@@ -1,0 +1,21 @@
+# Secrets & runtime state
+.env
+config.yaml
+state.db
+state.db-wal
+state.db-shm
+session/
+*.session
+*.session-journal
+cache/
+
+# Python / venv
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Logs & OS
+*.log
+.DS_Store

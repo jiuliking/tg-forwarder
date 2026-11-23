@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TG-Forwarder · 频道无痕搬运控制台</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+  <script>
+    (function () {
+      var t = localStorage.getItem('tgfwd_theme') || 'system';
+      var dark = t === 'dark' || (t === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+    })();
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
