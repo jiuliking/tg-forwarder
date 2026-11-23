@@ -374,12 +374,19 @@ class WebConsole:
 
     async def handle_rules_list(self, _request: web.Request) -> web.Response:
         raw = load_raw_config(self.config_path)
+        g = raw.get("global") or {}
         accounts = [{"id": a["id"], "name": a["name"], "enabled": bool(a.get("enabled", True))} for a in (raw.get("accounts") or [])]
         return web.json_response(
             {
                 "rules": raw.get("rules") or [],
                 "accounts": accounts,
                 "chat_titles": self.manager.all_chat_titles(),
+                "global_defaults": {
+                    "comment_wait_seconds": max(5, min(300, int(g.get("comment_wait_seconds", 30) or 30))),
+                    "comment_merge_mode": (
+                        "keep_batches" if str(g.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
+                    ),
+                },
             }
         )
 
@@ -406,7 +413,7 @@ class WebConsole:
             if pat:
                 replaces.append({"pattern": pat, "repl": str(rep.get("repl") or "")})
 
-        return {
+        rule_dict: dict[str, Any] = {
             "name": str(data.get("name") or "").strip() or "未命名规则",
             "enabled": bool(data.get("enabled", True)),
             "account_id": str(data.get("account_id") or default_acct).strip() or default_acct,
@@ -419,15 +426,18 @@ class WebConsole:
             "skip_empty_text_only": bool(data.get("skip_empty_text_only", True)),
             "disable_link_preview": bool(data.get("disable_link_preview", False)),
             "collect_comments": bool(data.get("collect_comments", False)),
-            "comment_wait_seconds": max(5, min(300, int(data.get("comment_wait_seconds") or 30))),
-            "comment_merge_mode": (
-                "keep_batches" if str(data.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
-            ),
             "skip_patterns": _clean_patterns(data.get("skip_patterns")),
             "strip_text_patterns": _clean_patterns(data.get("strip_text_patterns")),
             "strip_patterns": _clean_patterns(data.get("strip_patterns")),
             "replace_patterns": replaces,
         }
+        raw_cw = data.get("comment_wait_seconds")
+        if raw_cw not in (None, ""):
+            rule_dict["comment_wait_seconds"] = max(5, min(300, int(raw_cw)))
+        raw_cm = str(data.get("comment_merge_mode") or "").strip()
+        if raw_cm in ("pack", "keep_batches"):
+            rule_dict["comment_merge_mode"] = raw_cm
+        return rule_dict
 
     async def handle_rule_create(self, request: web.Request) -> web.Response:
         data = await request.json()
@@ -531,6 +541,10 @@ class WebConsole:
                 "delay_seconds": float(g.get("delay_seconds", 1.0)),
                 "max_download_mb": int(g.get("max_download_mb", 2000)),
                 "dedup_ttl_hours": int(g.get("dedup_ttl_hours", 48)),
+                "comment_wait_seconds": max(5, min(300, int(g.get("comment_wait_seconds", 30) or 30))),
+                "comment_merge_mode": (
+                    "keep_batches" if str(g.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
+                ),
                 "temp_dir": str(g.get("temp_dir") or (self.config_path.resolve().parent / "cache")),
                 "api_id": api_id,
                 "api_hash_masked": masked_hash,
@@ -550,6 +564,12 @@ class WebConsole:
             g["max_download_mb"] = max(1, int(data.get("max_download_mb", 2000)))
         if "dedup_ttl_hours" in data:
             g["dedup_ttl_hours"] = max(1, int(data.get("dedup_ttl_hours", 48)))
+        if "comment_wait_seconds" in data:
+            g["comment_wait_seconds"] = max(5, min(300, int(data.get("comment_wait_seconds") or 30)))
+        if "comment_merge_mode" in data:
+            g["comment_merge_mode"] = (
+                "keep_batches" if str(data.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
+            )
 
         if data.get("reset_api"):
             g.pop("api_id", None)

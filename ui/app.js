@@ -20,6 +20,7 @@
     phoneStep: 'input',
     phoneNum: '',
     settings: null,
+    ruleGlobalDefaults: { comment_wait_seconds: 30, comment_merge_mode: 'pack' },
     logManage: null,
     modalRule: null, // null | { idx, data, chats }
     modalPickerQuery: '',
@@ -188,6 +189,7 @@
         state.rules = d.rules || [];
         state.accounts = d.accounts || [];
         state.chatTitles = d.chat_titles || {};
+        if (d.global_defaults) state.ruleGlobalDefaults = d.global_defaults;
       } else if (path === '/chats') {
         const accts = await api('/api/accounts');
         state.accounts = accts.items || [];
@@ -507,7 +509,7 @@
                     ${r.drop_author !== false ? '<span class="badge info">无来源</span>' : ''}
                     ${r.fallback_reupload !== false ? '<span class="badge warning">受限重传</span>' : ''}
                     ${r.skip_text_only ? '<span class="badge info">跳过纯文字</span>' : ''}
-                    ${r.collect_comments ? `<span class="badge info">抓评论区(${r.comment_merge_mode === 'keep_batches' ? '按原批' : '凑满'})</span>` : ''}
+                    ${r.collect_comments ? `<span class="badge info">抓评论区(${(r.comment_merge_mode || state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批' : '凑满'})</span>` : ''}
                     ${r.strip_all_text ? '<span class="badge warning">仅媒体</span>' : ''}
                   </div>
                 </div>
@@ -753,6 +755,18 @@
             <label>消息去重保留时长（小时）</label>
             <input id="set-ttl" type="number" min="1" value="${esc(s.dedup_ttl_hours)}" />
           </div>
+          <div class="field">
+            <label>评论区默认等待收集窗口（秒）</label>
+            <input id="set-comment-wait" type="number" min="5" max="300" value="${esc(s.comment_wait_seconds ?? 30)}" />
+            <span class="hint">规则启用「抓取评论区」且未单独覆盖时使用；作者仍在继续传图会自动顺延</span>
+          </div>
+          <div class="field span-full">
+            <label>评论区默认媒体分组方式</label>
+            <select id="set-comment-mode">
+              <option value="pack" ${(s.comment_merge_mode || 'pack') === 'pack' ? 'selected' : ''}>自动凑满（主帖与评论合并，每组最多 10 项）</option>
+              <option value="keep_batches" ${s.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>按原批次发送（保持主帖与每条评论各自数量）</option>
+            </select>
+          </div>
           <div class="span-full actions">
             <button class="btn primary" type="submit">保存设置</button>
           </div>
@@ -995,15 +1009,16 @@
               data.collect_comments
                 ? `<div class="form-grid" style="padding:12px 14px;background:var(--paper);border:1px solid var(--line);border-radius:10px">
                      <div class="field">
-                       <label>评论区等待收集窗口（秒）</label>
-                       <input id="rm-comment-wait" type="number" min="5" max="300" value="${esc(data.comment_wait_seconds ?? 30)}" />
-                       <span class="hint">若作者仍在继续发图，会自动顺延至停发后 10 秒（最多顺延 60 秒）</span>
+                       <label>等待收集窗口覆盖（秒，可选）</label>
+                       <input id="rm-comment-wait" type="number" min="5" max="300" placeholder="跟随全局默认 (${esc(state.ruleGlobalDefaults?.comment_wait_seconds ?? 30)} 秒)" value="${data.comment_wait_seconds != null ? esc(data.comment_wait_seconds) : ''}" />
+                       <span class="hint">留空则使用「全局设置」的默认值；若作者仍在继续发图会自动顺延</span>
                      </div>
                      <div class="field">
-                       <label>媒体分组发送方式</label>
+                       <label>媒体分组发送方式覆盖（可选）</label>
                        <select id="rm-comment-mode">
-                         <option value="pack" ${(data.comment_merge_mode || 'pack') === 'pack' ? 'selected' : ''}>自动凑满（主帖与评论合并，每组最多 10 项）</option>
-                         <option value="keep_batches" ${data.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>按原批次发送（保持主帖与每条评论各自数量）</option>
+                         <option value="" ${!data.comment_merge_mode ? 'selected' : ''}>跟随全局默认（${(state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批次' : '自动凑满'}）</option>
+                         <option value="pack" ${data.comment_merge_mode === 'pack' ? 'selected' : ''}>单独指定：自动凑满（每组最多 10 项）</option>
+                         <option value="keep_batches" ${data.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>单独指定：按原批次发送</option>
                        </select>
                      </div>
                    </div>`
@@ -1461,8 +1476,11 @@
     d.skip_empty_text_only = g('rm-skip-empty').checked;
     d.disable_link_preview = g('rm-no-preview').checked;
     d.collect_comments = g('rm-collect-comments').checked;
-    if (g('rm-comment-wait')) d.comment_wait_seconds = Math.max(5, Math.min(300, Number(g('rm-comment-wait').value) || 30));
-    if (g('rm-comment-mode')) d.comment_merge_mode = g('rm-comment-mode').value || 'pack';
+    if (g('rm-comment-wait')) {
+      const wv = g('rm-comment-wait').value.trim();
+      d.comment_wait_seconds = wv ? Math.max(5, Math.min(300, Number(wv))) : null;
+    }
+    if (g('rm-comment-mode')) d.comment_merge_mode = g('rm-comment-mode').value || '';
     d.skip_patterns = g('rm-skip').value.split('\n').map((s) => s.trim()).filter(Boolean);
     d.strip_text_patterns = g('rm-strip-all-on-match').value.split('\n').map((s) => s.trim()).filter(Boolean);
     d.strip_patterns = g('rm-strip').value.split('\n').map((s) => s.trim()).filter(Boolean);
@@ -1640,8 +1658,8 @@
           skip_empty_text_only: true,
           disable_link_preview: false,
           collect_comments: false,
-          comment_wait_seconds: 30,
-          comment_merge_mode: 'pack',
+          comment_wait_seconds: null,
+          comment_merge_mode: '',
           skip_patterns: [],
           strip_text_patterns: [],
           strip_patterns: [],
@@ -2028,6 +2046,8 @@
               delay_seconds: Number(document.getElementById('set-delay').value),
               max_download_mb: Number(document.getElementById('set-maxmb').value),
               dedup_ttl_hours: Number(document.getElementById('set-ttl').value),
+              comment_wait_seconds: Number(document.getElementById('set-comment-wait').value),
+              comment_merge_mode: document.getElementById('set-comment-mode').value,
             }),
           });
           toast('设置已保存并热生效', 'success');

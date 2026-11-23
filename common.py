@@ -101,7 +101,12 @@ def _compile_patterns(items: Sequence[str] | None, field_name: str) -> list[re.P
     return compiled
 
 
-def compile_rule_dict(r: dict[str, Any], idx: int = 0) -> CompiledRule:
+def compile_rule_dict(
+    r: dict[str, Any],
+    idx: int = 0,
+    default_comment_wait: int = 30,
+    default_comment_mode: str = "pack",
+) -> CompiledRule:
     name = str(r.get("name") or f"rule-{idx + 1}")
     account_id = str(r.get("account_id") or "default").strip() or "default"
     replaces: list[CompiledReplace] = []
@@ -114,6 +119,12 @@ def compile_rule_dict(r: dict[str, Any], idx: int = 0) -> CompiledRule:
             replaces.append(CompiledReplace(re.compile(pat, re.MULTILINE), repl))
         except re.error as exc:
             raise ValueError(f"Invalid replace regex in {name}: {pat!r} ({exc})") from exc
+    raw_cw = r.get("comment_wait_seconds")
+    cw = default_comment_wait if raw_cw in (None, "") else max(5, min(300, int(raw_cw)))
+    raw_cm = str(r.get("comment_merge_mode") or "").strip()
+    cm = raw_cm if raw_cm in ("pack", "keep_batches") else (
+        "keep_batches" if default_comment_mode == "keep_batches" else "pack"
+    )
     return CompiledRule(
         name=name,
         enabled=bool(r.get("enabled", True)),
@@ -127,10 +138,8 @@ def compile_rule_dict(r: dict[str, Any], idx: int = 0) -> CompiledRule:
         skip_empty_text_only=bool(r.get("skip_empty_text_only", True)),
         disable_link_preview=bool(r.get("disable_link_preview", False)),
         collect_comments=bool(r.get("collect_comments", False)),
-        comment_wait_seconds=max(5, min(300, int(r.get("comment_wait_seconds", 30) or 30))),
-        comment_merge_mode=(
-            "keep_batches" if str(r.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
-        ),
+        comment_wait_seconds=cw,
+        comment_merge_mode=cm,
         skip_patterns=_compile_patterns(r.get("skip_patterns"), f"{name}.skip_patterns"),
         strip_text_patterns=_compile_patterns(r.get("strip_text_patterns"), f"{name}.strip_text_patterns"),
         strip_patterns=_compile_patterns(r.get("strip_patterns"), f"{name}.strip_patterns"),
@@ -187,7 +196,12 @@ def load_config(config_path: Path) -> AppConfig:
         )
         for a in (raw.get("accounts") or [])
     ]
-    rules_out = [compile_rule_dict(r, idx) for idx, r in enumerate(raw.get("rules") or [])]
+    default_cw = max(5, min(300, int(g.get("comment_wait_seconds", 30) or 30)))
+    default_cm = "keep_batches" if str(g.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
+    rules_out = [
+        compile_rule_dict(r, idx, default_comment_wait=default_cw, default_comment_mode=default_cm)
+        for idx, r in enumerate(raw.get("rules") or [])
+    ]
     return AppConfig(
         delay_seconds=float(g.get("delay_seconds", 1.0)),
         temp_dir=Path(g.get("temp_dir") or (Path(os.environ.get("TG_FWD_DIR") or Path(__file__).resolve().parent) / "cache")),

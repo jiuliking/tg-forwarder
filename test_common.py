@@ -156,15 +156,20 @@ def test_stores_and_config_roundtrip() -> None:
         save_raw_config(
             cfg_path,
             {
-                "global": {"delay_seconds": 1.5},
+                "global": {"delay_seconds": 1.5, "comment_wait_seconds": 45, "comment_merge_mode": "keep_batches"},
                 "accounts": [{"id": "default", "name": "A"}, {"id": "acct_2", "name": "B"}],
-                "rules": [{"name": "x", "account_id": "acct_2", "sources": [-1001], "targets": [-1002]}],
+                "rules": [
+                    {"name": "x", "account_id": "acct_2", "sources": [-1001], "targets": [-1002], "collect_comments": True},
+                    {"name": "y", "account_id": "acct_2", "sources": [-1001], "targets": [-1002], "collect_comments": True, "comment_wait_seconds": 15, "comment_merge_mode": "pack"},
+                ],
             },
         )
         loaded = load_config(cfg_path)
         assert loaded.delay_seconds == 1.5
         assert len(loaded.accounts) == 2
         assert loaded.rules[0].account_id == "acct_2"
+        assert loaded.rules[0].comment_wait_seconds == 45 and loaded.rules[0].comment_merge_mode == "keep_batches"
+        assert loaded.rules[1].comment_wait_seconds == 15 and loaded.rules[1].comment_merge_mode == "pack"
 
         # Test comment chunking modes: pack vs keep_batches
         batches = [["p1"], ["p2", "p3", "p4", "p5", "p6", "p7"], ["p8", "p9", "p10", "p11", "p12", "p13"]]
