@@ -372,6 +372,22 @@ class WebConsole:
         deleted = self.manager.history.clear(status)
         return web.json_response({"ok": True, "deleted": deleted, "stats": self.manager.history.stats_detail()})
 
+    async def handle_log_resend(self, request: web.Request) -> web.Response:
+        row_id = int(request.match_info["row_id"])
+        item = self.manager.history.get_by_id(row_id)
+        if not item:
+            return web.json_response({"error": "记录不存在或已被清理"}, status=404)
+        if int(item.get("target_id") or 0) == 0:
+            return web.json_response({"error": "该记录未关联目标频道，无法重发"}, status=400)
+        acct_id = str(item.get("account_id") or "default")
+        runner = self.manager.get_runner(acct_id)
+        if not runner or not runner.enabled:
+            return web.json_response({"error": f"执行账号 {acct_id} 不存在或已停用"}, status=400)
+        ok, info = await runner.resend_history_item(item)
+        if not ok:
+            return web.json_response({"error": info}, status=400)
+        return web.json_response({"ok": True, "mode": info})
+
     async def handle_rules_list(self, _request: web.Request) -> web.Response:
         raw = load_raw_config(self.config_path)
         g = raw.get("global") or {}
@@ -807,6 +823,7 @@ class WebConsole:
 
         app.router.add_get("/api/overview", self.handle_overview)
         app.router.add_get("/api/logs", self.handle_logs)
+        app.router.add_post("/api/logs/{row_id}/resend", self.handle_log_resend)
         app.router.add_get("/api/logs/manage", self.handle_logs_manage_get)
         app.router.add_put("/api/logs/manage", self.handle_logs_manage_put)
         app.router.add_post("/api/logs/prune", self.handle_logs_prune)

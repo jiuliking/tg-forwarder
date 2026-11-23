@@ -397,27 +397,37 @@ class AccountRunner:
         source_title: str,
         main_msgs: list[Any],
         rule: CompiledRule,
-    ) -> None:
+        *,
+        skip_wait: bool = False,
+        target_override: Optional[tuple[Any, int, str]] = None,
+        detail_prefix: str = "",
+    ) -> tuple[bool, str]:
         if not self.enabled or not main_msgs:
-            return
+            return False, "账号未启用或消息为空"
         lead_id = main_msgs[0].id
         thread_msg_id = next((m.id for m in main_msgs if getattr(m, "replies", None)), lead_id)
-        wait_s = max(5, rule.comment_wait_seconds)
-        start_ts = time.time()
-        max_deadline = start_ts + wait_s + 60.0
 
-        await asyncio.sleep(wait_s)
-        if not self.enabled:
-            return
+        if not skip_wait:
+            wait_s = max(5, rule.comment_wait_seconds)
+            start_ts = time.time()
+            max_deadline = start_ts + wait_s + 60.0
 
-        comment_batches, fb_text, fb_entities, latest_ts = await self._fetch_channel_comment_batches(
-            chat, source_id, thread_msg_id
-        )
-        while latest_ts > 0 and (time.time() - latest_ts) < 10.0 and time.time() < max_deadline:
-            await asyncio.sleep(5)
+            await asyncio.sleep(wait_s)
             if not self.enabled:
-                return
+                return False, "账号已停止"
+
             comment_batches, fb_text, fb_entities, latest_ts = await self._fetch_channel_comment_batches(
+                chat, source_id, thread_msg_id
+            )
+            while latest_ts > 0 and (time.time() - latest_ts) < 10.0 and time.time() < max_deadline:
+                await asyncio.sleep(5)
+                if not self.enabled:
+                    return False, "账号已停止"
+                comment_batches, fb_text, fb_entities, latest_ts = await self._fetch_channel_comment_batches(
+                    chat, source_id, thread_msg_id
+                )
+        else:
+            comment_batches, fb_text, fb_entities, _ = await self._fetch_channel_comment_batches(
                 chat, source_id, thread_msg_id
             )
 
@@ -438,44 +448,45 @@ class AccountRunner:
         raw_preview = chosen_text or (f"[媒体 {total_media} 项]" if total_media else "[纯文字消息]")
 
         async with self._send_lock:
-            matched_skip = should_skip_text(chosen_text, rule)
-            if matched_skip:
-                log.info("[%s/%s] Skip post+comments %s (matched %r)", self.account_name, rule.name, lead_id, matched_skip)
-                self.manager.history.record(
-                    account_id=self.account_id,
-                    account_name=self.account_name,
-                    rule_name=rule.name,
-                    source_id=source_id,
-                    source_title=source_title,
-                    target_id=0,
-                    target_title="-",
-                    msg_id=lead_id,
-                    item_count=max(1, total_media),
-                    mode="skip_regex",
-                    status="skipped",
-                    preview=raw_preview,
-                    detail=f"命中跳过正则: {matched_skip}",
-                )
-                return
+            if target_override is None:
+                matched_skip = should_skip_text(chosen_text, rule)
+                if matched_skip:
+                    log.info("[%s/%s] Skip post+comments %s (matched %r)", self.account_name, rule.name, lead_id, matched_skip)
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=0,
+                        target_title="-",
+                        msg_id=lead_id,
+                        item_count=max(1, total_media),
+                        mode="skip_regex",
+                        status="skipped",
+                        preview=raw_preview,
+                        detail=f"命中跳过正则: {matched_skip}",
+                    )
+                    return False, f"命中跳过正则: {matched_skip}"
 
-            if total_media == 0 and rule.skip_text_only:
-                log.info("[%s/%s] Skip text-only msg %s (no media in comments)", self.account_name, rule.name, lead_id)
-                self.manager.history.record(
-                    account_id=self.account_id,
-                    account_name=self.account_name,
-                    rule_name=rule.name,
-                    source_id=source_id,
-                    source_title=source_title,
-                    target_id=0,
-                    target_title="-",
-                    msg_id=lead_id,
-                    item_count=1,
-                    mode="skip_text_only",
-                    status="skipped",
-                    preview=raw_preview,
-                    detail="主帖与评论区均无媒体，已跳过纯文字消息",
-                )
-                return
+                if total_media == 0 and rule.skip_text_only:
+                    log.info("[%s/%s] Skip text-only msg %s (no media in comments)", self.account_name, rule.name, lead_id)
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=0,
+                        target_title="-",
+                        msg_id=lead_id,
+                        item_count=1,
+                        mode="skip_text_only",
+                        status="skipped",
+                        preview=raw_preview,
+                        detail="主帖与评论区均无媒体，已跳过纯文字消息",
+                    )
+                    return False, "主帖与评论区均无媒体"
 
             clear_caption = rule.strip_all_text or (should_strip_all_text(chosen_text, rule) is not None)
             if clear_caption:
@@ -483,7 +494,7 @@ class AccountRunner:
             else:
                 cleaned_text, cleaned_entities, _ = clean_message_text(chosen_text, chosen_entities, rule)
 
-            if total_media == 0 and not cleaned_text.strip() and (rule.skip_empty_text_only or clear_caption):
+            if target_override is None and total_media == 0 and not cleaned_text.strip() and (rule.skip_empty_text_only or clear_caption):
                 self.manager.history.record(
                     account_id=self.account_id,
                     account_name=self.account_name,
@@ -499,20 +510,28 @@ class AccountRunner:
                     preview=raw_preview,
                     detail="清洗后为空文本",
                 )
-                return
+                return False, "清洗后为空文本"
 
             chunks = build_media_chunks(all_batches, rule.comment_merge_mode, self._media_bucket, max_album=10)
             clean_preview = cleaned_text or (f"[评论区合并 {total_media} 项]" if comment_batches else f"[媒体 {total_media} 项]")
 
-            for tgt in rule.targets:
-                target_ent = self.target_cache.get(tgt)
-                if target_ent is None:
-                    continue
-                target_id = utils.get_peer_id(target_ent)
-                target_title = self.chat_titles.get(target_id, str(tgt))
-                if self.manager.dedup.seen(source_id, lead_id, target_id, account_id=self.account_id):
-                    continue
+            target_list: list[tuple[Any, int, str]] = []
+            if target_override is not None:
+                target_list.append(target_override)
+            else:
+                for tgt in rule.targets:
+                    te = self.target_cache.get(tgt)
+                    if te is None:
+                        continue
+                    tid = utils.get_peer_id(te)
+                    ttitle = self.chat_titles.get(tid, str(tgt))
+                    if self.manager.dedup.seen(source_id, lead_id, tid, account_id=self.account_id):
+                        continue
+                    target_list.append((te, tid, ttitle))
 
+            last_ok = False
+            last_msg = "无可用目标频道"
+            for target_ent, target_id, target_title in target_list:
                 mode = "comments_batch" if rule.comment_merge_mode == "keep_batches" else "comments_pack"
                 try:
                     if total_media == 0:
@@ -534,6 +553,7 @@ class AccountRunner:
                                     preview=clean_preview,
                                     detail="源频道禁止转发且未启用重传",
                                 )
+                                last_ok, last_msg = False, "源频道禁止转发且未启用重传"
                                 continue
                         await self._call_with_flood_retry(
                             lambda: self.client.send_message(
@@ -595,6 +615,7 @@ class AccountRunner:
                                         preview=clean_preview,
                                         detail="源频道禁止转发且未启用重传",
                                     )
+                                    last_ok, last_msg = False, "源频道禁止转发且未启用重传"
                                     aborted = True
                                     break
                                 any_reuploaded = True
@@ -620,6 +641,7 @@ class AccountRunner:
                                         preview=clean_preview,
                                         detail="超出最大下载大小或下载为空",
                                     )
+                                    last_ok, last_msg = False, "超出最大下载大小或下载为空"
                                     aborted = True
                                     break
                         if aborted:
@@ -629,6 +651,8 @@ class AccountRunner:
 
                     for m in main_msgs:
                         self.manager.dedup.mark(source_id, m.id, target_id, account_id=self.account_id)
+                    cmt_note = f"含评论区媒体 {sum(len(b) for b in comment_batches)} 项（{len(chunks)} 组）" if comment_batches else ""
+                    detail_txt = " · ".join(p for p in [detail_prefix, cmt_note] if p)
                     self.manager.history.record(
                         account_id=self.account_id,
                         account_name=self.account_name,
@@ -642,9 +666,7 @@ class AccountRunner:
                         mode=mode,
                         status="success",
                         preview=clean_preview,
-                        detail=f"含评论区媒体 {sum(len(b) for b in comment_batches)} 项（{len(chunks)} 组）"
-                        if comment_batches
-                        else "",
+                        detail=detail_txt,
                     )
                     log.info(
                         "[%s/%s] Forwarded post %s (+%d comment items in %d chunks, %s -> %s, mode=%s)",
@@ -657,8 +679,9 @@ class AccountRunner:
                         target_id,
                         mode,
                     )
+                    last_ok, last_msg = True, mode
                 except Exception as exc:
-                    log.exception("[%s/%s] Failed post+comments %s -> %s: %s", self.account_name, rule.name, lead_id, tgt, exc)
+                    log.exception("[%s/%s] Failed post+comments %s -> %s: %s", self.account_name, rule.name, lead_id, target_id, exc)
                     self.manager.history.record(
                         account_id=self.account_id,
                         account_name=self.account_name,
@@ -674,8 +697,418 @@ class AccountRunner:
                         preview=clean_preview,
                         detail=str(exc),
                     )
-                if self.manager.cfg.delay_seconds > 0:
+                    last_ok, last_msg = False, str(exc)
+                if target_override is None and self.manager.cfg.delay_seconds > 0:
                     await asyncio.sleep(self.manager.cfg.delay_seconds)
+            return last_ok, last_msg
+
+    async def _deliver_single_to_target(
+        self,
+        chat: Any,
+        source_id: int,
+        source_title: str,
+        msg: Any,
+        rule: CompiledRule,
+        target_ent: Any,
+        target_id: int,
+        target_title: str,
+        cleaned_text: str,
+        cleaned_entities: Optional[list[Any]],
+        changed: bool,
+        clear_caption: bool,
+        has_real_media: bool,
+        detail_note: str = "",
+    ) -> tuple[bool, str]:
+        mode = "copy"
+        try:
+            restricted = self._is_noforwards(chat, [msg])
+            if not restricted and (not changed or clear_caption) and rule.drop_author:
+                try:
+                    await self._call_with_flood_retry(
+                        lambda: self.client.forward_messages(
+                            target_ent,
+                            msg.id,
+                            source_id,
+                            drop_author=True,
+                            drop_media_captions=clear_caption,
+                        )
+                    )
+                    mode = "cleaned" if clear_caption and changed else "copy"
+                except ChatForwardsRestrictedError:
+                    restricted = True
+            elif not restricted:
+                try:
+                    mode = "cleaned"
+                    if has_real_media:
+                        await self._call_with_flood_retry(
+                            lambda: self.client.send_file(
+                                target_ent,
+                                msg.media,
+                                caption=cleaned_text,
+                                formatting_entities=cleaned_entities,
+                            )
+                        )
+                    else:
+                        await self._call_with_flood_retry(
+                            lambda: self.client.send_message(
+                                target_ent,
+                                cleaned_text,
+                                formatting_entities=cleaned_entities,
+                                link_preview=(not rule.disable_link_preview)
+                                and isinstance(msg.media, MessageMediaWebPage),
+                            )
+                        )
+                except ChatForwardsRestrictedError:
+                    restricted = True
+
+            if restricted:
+                if not rule.fallback_reupload:
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=target_id,
+                        target_title=target_title,
+                        msg_id=msg.id,
+                        item_count=1,
+                        mode="skip_restricted",
+                        status="skipped",
+                        preview=cleaned_text or "[媒体消息]",
+                        detail="源频道禁止转发且未启用重传",
+                    )
+                    return False, "源频道禁止转发且未启用重传"
+                mode = "reupload"
+                uploaded = await self._reupload_single(target_ent, msg, cleaned_text, cleaned_entities, rule)
+                if not uploaded:
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=target_id,
+                        target_title=target_title,
+                        msg_id=msg.id,
+                        item_count=1,
+                        mode="skip_size",
+                        status="skipped",
+                        preview=cleaned_text or "[媒体消息]",
+                        detail="超出最大下载大小或下载为空",
+                    )
+                    return False, "超出最大下载大小或下载为空"
+
+            self.manager.dedup.mark(source_id, msg.id, target_id, account_id=self.account_id)
+            self.manager.history.record(
+                account_id=self.account_id,
+                account_name=self.account_name,
+                rule_name=rule.name,
+                source_id=source_id,
+                source_title=source_title,
+                target_id=target_id,
+                target_title=target_title,
+                msg_id=msg.id,
+                item_count=1,
+                mode=mode,
+                status="success",
+                preview=cleaned_text or "[媒体消息]",
+                detail=detail_note,
+            )
+            log.info("[%s/%s] Forwarded msg %s (%s -> %s, mode=%s)", self.account_name, rule.name, msg.id, source_id, target_id, mode)
+            return True, mode
+        except Exception as exc:
+            log.exception("[%s/%s] Failed msg %s -> %s: %s", self.account_name, rule.name, msg.id, target_id, exc)
+            self.manager.history.record(
+                account_id=self.account_id,
+                account_name=self.account_name,
+                rule_name=rule.name,
+                source_id=source_id,
+                source_title=source_title,
+                target_id=target_id,
+                target_title=target_title,
+                msg_id=msg.id,
+                item_count=1,
+                mode=mode,
+                status="error",
+                preview=cleaned_text or (msg.message or "") or "[媒体消息]",
+                detail=str(exc),
+            )
+            return False, str(exc)
+
+    async def _deliver_album_to_target(
+        self,
+        chat: Any,
+        source_id: int,
+        source_title: str,
+        msgs: list[Any],
+        rule: CompiledRule,
+        target_ent: Any,
+        target_id: int,
+        target_title: str,
+        captions: list[str],
+        entities_list: list[list[Any]],
+        any_changed: bool,
+        clear_caption: bool,
+        clean_preview: str,
+        detail_note: str = "",
+    ) -> tuple[bool, str]:
+        lead_id = msgs[0].id
+        mode = "copy"
+        try:
+            restricted = self._is_noforwards(chat, msgs)
+            if not restricted and (not any_changed or clear_caption) and rule.drop_author:
+                try:
+                    await self._call_with_flood_retry(
+                        lambda: self.client.forward_messages(
+                            target_ent,
+                            [m.id for m in msgs],
+                            source_id,
+                            drop_author=True,
+                            drop_media_captions=clear_caption,
+                            as_album=True,
+                        )
+                    )
+                    mode = "cleaned" if clear_caption and any_changed else "copy"
+                except ChatForwardsRestrictedError:
+                    restricted = True
+            elif not restricted:
+                try:
+                    mode = "cleaned"
+                    media_list = [m.media for m in msgs if self._is_real_media(m)]
+                    if len(media_list) == len(msgs):
+                        await self._call_with_flood_retry(
+                            lambda: self.client.send_file(
+                                target_ent,
+                                media_list,
+                                caption=captions,
+                                formatting_entities=entities_list,
+                            )
+                        )
+                    else:
+                        restricted = True
+                except ChatForwardsRestrictedError:
+                    restricted = True
+
+            if restricted:
+                if not rule.fallback_reupload:
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=target_id,
+                        target_title=target_title,
+                        msg_id=lead_id,
+                        item_count=len(msgs),
+                        mode="skip_restricted",
+                        status="skipped",
+                        preview=clean_preview,
+                        detail="源频道禁止转发且未启用重传",
+                    )
+                    return False, "源频道禁止转发且未启用重传"
+                mode = "reupload"
+                uploaded = await self._reupload_album(target_ent, msgs, captions, entities_list)
+                if not uploaded:
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=target_id,
+                        target_title=target_title,
+                        msg_id=lead_id,
+                        item_count=len(msgs),
+                        mode="skip_size",
+                        status="skipped",
+                        preview=clean_preview,
+                        detail="超出最大下载大小或下载为空",
+                    )
+                    return False, "超出最大下载大小或下载为空"
+
+            for m in msgs:
+                self.manager.dedup.mark(source_id, m.id, target_id, account_id=self.account_id)
+            self.manager.history.record(
+                account_id=self.account_id,
+                account_name=self.account_name,
+                rule_name=rule.name,
+                source_id=source_id,
+                source_title=source_title,
+                target_id=target_id,
+                target_title=target_title,
+                msg_id=lead_id,
+                item_count=len(msgs),
+                mode=mode,
+                status="success",
+                preview=clean_preview,
+                detail=detail_note,
+            )
+            log.info(
+                "[%s/%s] Forwarded album %s (%d items, %s -> %s, mode=%s)",
+                self.account_name,
+                rule.name,
+                lead_id,
+                len(msgs),
+                source_id,
+                target_id,
+                mode,
+            )
+            return True, mode
+        except Exception as exc:
+            log.exception("[%s/%s] Failed album %s -> %s: %s", self.account_name, rule.name, lead_id, target_id, exc)
+            self.manager.history.record(
+                account_id=self.account_id,
+                account_name=self.account_name,
+                rule_name=rule.name,
+                source_id=source_id,
+                source_title=source_title,
+                target_id=target_id,
+                target_title=target_title,
+                msg_id=lead_id,
+                item_count=len(msgs),
+                mode=mode,
+                status="error",
+                preview=clean_preview,
+                detail=str(exc),
+            )
+            return False, str(exc)
+
+    def _find_rule_for_history(self, item: dict[str, Any], source_id: int) -> CompiledRule:
+        rule_name = str(item.get("rule_name") or "")
+        for r in self.manager.cfg.rules:
+            if r.account_id == self.account_id and r.name == rule_name:
+                return r
+        for r in self.manager.cfg.rules:
+            if r.account_id == self.account_id and source_id in r.sources:
+                return r
+        mode = str(item.get("mode") or "")
+        return CompiledRule(
+            name=rule_name or "手动重发",
+            enabled=True,
+            account_id=self.account_id,
+            sources=[source_id],
+            targets=[int(item["target_id"])],
+            drop_author=True,
+            fallback_reupload=True,
+            collect_comments=mode in ("comments_pack", "comments_batch"),
+            comment_wait_seconds=self.manager.cfg.rules[0].comment_wait_seconds if self.manager.cfg.rules else 30,
+            comment_merge_mode="keep_batches" if mode == "comments_batch" else "pack",
+        )
+
+    async def resend_history_item(self, item: dict[str, Any]) -> tuple[bool, str]:
+        source_id = int(item["source_id"])
+        target_id = int(item["target_id"])
+        msg_id = int(item["msg_id"])
+        if target_id == 0:
+            return False, "该记录没有目标频道，无法重发"
+        if not self.client.is_connected():
+            await self.client.connect()
+        if not await self.client.is_user_authorized():
+            return False, "对应账号尚未登录 Telegram"
+
+        try:
+            source_ent = await self.client.get_entity(source_id)
+            target_ent = self.target_cache.get(target_id) or await self.client.get_entity(target_id)
+        except Exception as exc:
+            return False, f"无法访问源/目标频道: {exc}"
+
+        source_title = self._entity_title(source_ent, item.get("source_title") or source_id)
+        target_title = self._entity_title(target_ent, item.get("target_title") or target_id)
+
+        lead_msg = await self.client.get_messages(source_ent, ids=msg_id)
+        if lead_msg is None:
+            return False, "源频道原消息已被删除或无法读取"
+
+        main_msgs: list[Any] = [lead_msg]
+        gid = getattr(lead_msg, "grouped_id", None)
+        if gid is not None:
+            cand_ids = list(range(max(1, msg_id - 9), msg_id + 10))
+            cands = await self.client.get_messages(source_ent, ids=cand_ids)
+            grouped = [m for m in (cands or []) if m is not None and getattr(m, "grouped_id", None) == gid]
+            if grouped:
+                grouped.sort(key=lambda m: m.id)
+                main_msgs = grouped
+
+        rule = self._find_rule_for_history(item, source_id)
+        hist_mode = str(item.get("mode") or "")
+        is_broadcast = bool(getattr(source_ent, "broadcast", False))
+        if (rule.collect_comments and is_broadcast) or (hist_mode in ("comments_pack", "comments_batch") and is_broadcast):
+            return await self._process_with_comments(
+                source_ent,
+                source_id,
+                source_title,
+                main_msgs,
+                rule,
+                skip_wait=True,
+                target_override=(target_ent, target_id, target_title),
+                detail_prefix="手动重发",
+            )
+
+        async with self._send_lock:
+            if len(main_msgs) > 1:
+                clear_caption = rule.strip_all_text or any(
+                    should_strip_all_text(m.message or "", rule) is not None for m in main_msgs
+                )
+                captions: list[str] = []
+                entities_list: list[list[Any]] = []
+                any_changed = False
+                for m in main_msgs:
+                    if clear_caption:
+                        captions.append("")
+                        entities_list.append([])
+                        if m.message:
+                            any_changed = True
+                    else:
+                        ct, ce, ch = clean_message_text(m.message or "", m.entities, rule)
+                        captions.append(ct)
+                        entities_list.append(ce or [])
+                        if ch:
+                            any_changed = True
+                clean_preview = next((c for c in captions if c), "") or f"[相册 {len(main_msgs)} 项]"
+                return await self._deliver_album_to_target(
+                    source_ent,
+                    source_id,
+                    source_title,
+                    main_msgs,
+                    rule,
+                    target_ent,
+                    target_id,
+                    target_title,
+                    captions,
+                    entities_list,
+                    any_changed,
+                    clear_caption,
+                    clean_preview,
+                    detail_note="手动重发",
+                )
+
+            msg = main_msgs[0]
+            raw_text = msg.message or ""
+            orig_entities = list(msg.entities) if msg.entities else None
+            has_real_media = self._is_real_media(msg)
+            clear_caption = rule.strip_all_text or (should_strip_all_text(raw_text, rule) is not None)
+            if clear_caption:
+                cleaned_text, cleaned_entities, changed = "", None, bool(raw_text)
+            else:
+                cleaned_text, cleaned_entities, changed = clean_message_text(raw_text, orig_entities, rule)
+            return await self._deliver_single_to_target(
+                source_ent,
+                source_id,
+                source_title,
+                msg,
+                rule,
+                target_ent,
+                target_id,
+                target_title,
+                cleaned_text,
+                cleaned_entities,
+                changed,
+                clear_caption,
+                has_real_media,
+                detail_note="手动重发",
+            )
 
     async def process_single(self, event: events.NewMessage.Event) -> None:
         if not self.enabled:
@@ -779,119 +1212,21 @@ class AccountRunner:
                     if self.manager.dedup.seen(source_id, msg.id, target_id, account_id=self.account_id):
                         continue
 
-                    mode = "copy"
-                    try:
-                        restricted = self._is_noforwards(chat, [msg])
-                        if not restricted and (not changed or clear_caption) and rule.drop_author:
-                            try:
-                                await self._call_with_flood_retry(
-                                    lambda: self.client.forward_messages(
-                                        target_ent,
-                                        msg.id,
-                                        source_id,
-                                        drop_author=True,
-                                        drop_media_captions=clear_caption,
-                                    )
-                                )
-                                mode = "cleaned" if clear_caption and changed else "copy"
-                            except ChatForwardsRestrictedError:
-                                restricted = True
-                        elif not restricted:
-                            try:
-                                mode = "cleaned"
-                                if has_real_media:
-                                    await self._call_with_flood_retry(
-                                        lambda: self.client.send_file(
-                                            target_ent,
-                                            msg.media,
-                                            caption=cleaned_text,
-                                            formatting_entities=cleaned_entities,
-                                        )
-                                    )
-                                else:
-                                    await self._call_with_flood_retry(
-                                        lambda: self.client.send_message(
-                                            target_ent,
-                                            cleaned_text,
-                                            formatting_entities=cleaned_entities,
-                                            link_preview=(not rule.disable_link_preview)
-                                            and isinstance(msg.media, MessageMediaWebPage),
-                                        )
-                                    )
-                            except ChatForwardsRestrictedError:
-                                restricted = True
-
-                        if restricted:
-                            if not rule.fallback_reupload:
-                                self.manager.history.record(
-                                    account_id=self.account_id,
-                                    account_name=self.account_name,
-                                    rule_name=rule.name,
-                                    source_id=source_id,
-                                    source_title=source_title,
-                                    target_id=target_id,
-                                    target_title=target_title,
-                                    msg_id=msg.id,
-                                    item_count=1,
-                                    mode="skip_restricted",
-                                    status="skipped",
-                                    preview=cleaned_text or "[媒体消息]",
-                                    detail="源频道禁止转发且未启用重传",
-                                )
-                                continue
-                            mode = "reupload"
-                            uploaded = await self._reupload_single(target_ent, msg, cleaned_text, cleaned_entities, rule)
-                            if not uploaded:
-                                self.manager.history.record(
-                                    account_id=self.account_id,
-                                    account_name=self.account_name,
-                                    rule_name=rule.name,
-                                    source_id=source_id,
-                                    source_title=source_title,
-                                    target_id=target_id,
-                                    target_title=target_title,
-                                    msg_id=msg.id,
-                                    item_count=1,
-                                    mode="skip_size",
-                                    status="skipped",
-                                    preview=cleaned_text or "[媒体消息]",
-                                    detail="超出最大下载大小或下载为空",
-                                )
-                                continue
-
-                        self.manager.dedup.mark(source_id, msg.id, target_id, account_id=self.account_id)
-                        self.manager.history.record(
-                            account_id=self.account_id,
-                            account_name=self.account_name,
-                            rule_name=rule.name,
-                            source_id=source_id,
-                            source_title=source_title,
-                            target_id=target_id,
-                            target_title=target_title,
-                            msg_id=msg.id,
-                            item_count=1,
-                            mode=mode,
-                            status="success",
-                            preview=cleaned_text or "[媒体消息]",
-                        )
-                        log.info("[%s/%s] Forwarded msg %s (%s -> %s, mode=%s)", self.account_name, rule.name, msg.id, source_id, target_id, mode)
-                    except Exception as exc:
-                        log.exception("[%s/%s] Failed msg %s -> %s: %s", self.account_name, rule.name, msg.id, tgt, exc)
-                        self.manager.history.record(
-                            account_id=self.account_id,
-                            account_name=self.account_name,
-                            rule_name=rule.name,
-                            source_id=source_id,
-                            source_title=source_title,
-                            target_id=target_id,
-                            target_title=target_title,
-                            msg_id=msg.id,
-                            item_count=1,
-                            mode=mode,
-                            status="error",
-                            preview=cleaned_text or raw_text or "[媒体消息]",
-                            detail=str(exc),
-                        )
+                    await self._deliver_single_to_target(
+                        chat,
+                        source_id,
+                        source_title,
+                        msg,
+                        rule,
+                        target_ent,
+                        target_id,
+                        target_title,
+                        cleaned_text,
+                        cleaned_entities,
+                        changed,
+                        clear_caption,
+                        has_real_media,
+                    )
 
                     if self.manager.cfg.delay_seconds > 0:
                         await asyncio.sleep(self.manager.cfg.delay_seconds)
@@ -977,123 +1312,21 @@ class AccountRunner:
                     if self.manager.dedup.seen(source_id, lead_id, target_id, account_id=self.account_id):
                         continue
 
-                    mode = "copy"
-                    try:
-                        restricted = self._is_noforwards(chat, msgs)
-                        if not restricted and (not any_changed or clear_caption) and rule.drop_author:
-                            try:
-                                await self._call_with_flood_retry(
-                                    lambda: self.client.forward_messages(
-                                        target_ent,
-                                        [m.id for m in msgs],
-                                        source_id,
-                                        drop_author=True,
-                                        drop_media_captions=clear_caption,
-                                        as_album=True,
-                                    )
-                                )
-                                mode = "cleaned" if clear_caption and any_changed else "copy"
-                            except ChatForwardsRestrictedError:
-                                restricted = True
-                        elif not restricted:
-                            try:
-                                mode = "cleaned"
-                                media_list = [m.media for m in msgs if self._is_real_media(m)]
-                                if len(media_list) == len(msgs):
-                                    await self._call_with_flood_retry(
-                                        lambda: self.client.send_file(
-                                            target_ent,
-                                            media_list,
-                                            caption=captions,
-                                            formatting_entities=entities_list,
-                                        )
-                                    )
-                                else:
-                                    restricted = True
-                            except ChatForwardsRestrictedError:
-                                restricted = True
-
-                        if restricted:
-                            if not rule.fallback_reupload:
-                                self.manager.history.record(
-                                    account_id=self.account_id,
-                                    account_name=self.account_name,
-                                    rule_name=rule.name,
-                                    source_id=source_id,
-                                    source_title=source_title,
-                                    target_id=target_id,
-                                    target_title=target_title,
-                                    msg_id=lead_id,
-                                    item_count=len(msgs),
-                                    mode="skip_restricted",
-                                    status="skipped",
-                                    preview=clean_preview,
-                                    detail="源频道禁止转发且未启用重传",
-                                )
-                                continue
-                            mode = "reupload"
-                            uploaded = await self._reupload_album(target_ent, msgs, captions, entities_list)
-                            if not uploaded:
-                                self.manager.history.record(
-                                    account_id=self.account_id,
-                                    account_name=self.account_name,
-                                    rule_name=rule.name,
-                                    source_id=source_id,
-                                    source_title=source_title,
-                                    target_id=target_id,
-                                    target_title=target_title,
-                                    msg_id=lead_id,
-                                    item_count=len(msgs),
-                                    mode="skip_size",
-                                    status="skipped",
-                                    preview=clean_preview,
-                                    detail="超出最大下载大小或下载为空",
-                                )
-                                continue
-
-                        for m in msgs:
-                            self.manager.dedup.mark(source_id, m.id, target_id, account_id=self.account_id)
-                        self.manager.history.record(
-                            account_id=self.account_id,
-                            account_name=self.account_name,
-                            rule_name=rule.name,
-                            source_id=source_id,
-                            source_title=source_title,
-                            target_id=target_id,
-                            target_title=target_title,
-                            msg_id=lead_id,
-                            item_count=len(msgs),
-                            mode=mode,
-                            status="success",
-                            preview=clean_preview,
-                        )
-                        log.info(
-                            "[%s/%s] Forwarded album %s (%d items, %s -> %s, mode=%s)",
-                            self.account_name,
-                            rule.name,
-                            lead_id,
-                            len(msgs),
-                            source_id,
-                            target_id,
-                            mode,
-                        )
-                    except Exception as exc:
-                        log.exception("[%s/%s] Failed album %s -> %s: %s", self.account_name, rule.name, lead_id, tgt, exc)
-                        self.manager.history.record(
-                            account_id=self.account_id,
-                            account_name=self.account_name,
-                            rule_name=rule.name,
-                            source_id=source_id,
-                            source_title=source_title,
-                            target_id=target_id,
-                            target_title=target_title,
-                            msg_id=lead_id,
-                            item_count=len(msgs),
-                            mode=mode,
-                            status="error",
-                            preview=clean_preview,
-                            detail=str(exc),
-                        )
+                    await self._deliver_album_to_target(
+                        chat,
+                        source_id,
+                        source_title,
+                        msgs,
+                        rule,
+                        target_ent,
+                        target_id,
+                        target_title,
+                        captions,
+                        entities_list,
+                        any_changed,
+                        clear_caption,
+                        clean_preview,
+                    )
 
                     if self.manager.cfg.delay_seconds > 0:
                         await asyncio.sleep(self.manager.cfg.delay_seconds)

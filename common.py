@@ -550,6 +550,10 @@ class HistoryStore:
         self.conn.commit()
         return deleted
 
+    def get_by_id(self, row_id: int) -> Optional[dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM history WHERE id = ?", (int(row_id),)).fetchone()
+        return dict(row) if row else None
+
     def stats_detail(self) -> dict[str, Any]:
         row = self.conn.execute(
             """

@@ -139,6 +139,9 @@ def test_stores_and_config_roundtrip() -> None:
         )
         detail = hist.stats_detail()
         assert detail["total_count"] == 2 and detail["skipped_count"] == 1
+        rows_all = hist.recent(10)
+        assert hist.get_by_id(rows_all[0]["id"])["mode"] == rows_all[0]["mode"]
+        assert hist.get_by_id(999999) is None
         assert hist.clear("skipped") == 1
         assert hist.stats_detail()["total_count"] == 1
         assert hist.clear("") == 1

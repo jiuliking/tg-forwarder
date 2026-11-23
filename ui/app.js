@@ -433,7 +433,7 @@
 
       <div class="table-wrap">
         <table>
-          <thead><tr><th>时间</th><th>账号 / 规则</th><th>方式</th><th>源频道 → 目标频道</th><th>内容摘要</th></tr></thead>
+          <thead><tr><th>时间</th><th>账号 / 规则</th><th>方式</th><th>源频道 → 目标频道</th><th>内容摘要</th><th>操作</th></tr></thead>
           <tbody>
             ${
               items.length
@@ -452,10 +452,17 @@
                       <div>${esc(it.preview || '[媒体消息]')}</div>
                       ${it.detail ? `<div class="hint" style="color:${it.status === 'error' ? 'var(--danger)' : 'var(--text-3)'}">${esc(it.detail)}</div>` : ''}
                     </td>
+                    <td style="white-space:nowrap">
+                      ${
+                        it.target_id && Number(it.target_id) !== 0
+                          ? `<button type="button" class="btn small" data-resend-log="${it.id}">重发</button>`
+                          : '<span class="muted">-</span>'
+                      }
+                    </td>
                   </tr>`
                     )
                     .join('')
-                : '<tr><td colspan="5" class="empty">暂无符合条件的记录</td></tr>'
+                : '<tr><td colspan="6" class="empty">暂无符合条件的记录</td></tr>'
             }
           </tbody>
         </table>
@@ -1593,6 +1600,22 @@
     if (btnRefreshOv) btnRefreshOv.onclick = () => loadRouteData('/');
     const btnRefreshLogs = document.getElementById('btn-refresh-logs');
     if (btnRefreshLogs) btnRefreshLogs.onclick = () => loadRouteData('/logs');
+    document.querySelectorAll('[data-resend-log]').forEach((b) => {
+      b.onclick = async () => {
+        const id = b.dataset.resendLog;
+        b.disabled = true;
+        b.textContent = '重发中...';
+        try {
+          await api(`/api/logs/${encodeURIComponent(id)}/resend`, { method: 'POST' });
+          toast('已重新发送到目标频道', 'success');
+          await loadRouteData('/logs');
+        } catch (err) {
+          toast(err.message, 'danger');
+          b.disabled = false;
+          b.textContent = '重发';
+        }
+      };
+    });
 
     const logAcct = document.getElementById('log-filter-account');
     if (logAcct) logAcct.onchange = () => { state.logs.account_id = logAcct.value; loadRouteData('/logs'); };
