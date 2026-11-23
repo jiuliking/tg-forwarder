@@ -299,6 +299,7 @@ class WebConsole:
                         "sources": r.get("sources") or [],
                         "targets": r.get("targets") or [],
                         "drop_author": bool(r.get("drop_author", True)),
+                        "skip_text_only": bool(r.get("skip_text_only", False)),
                         "strip_all_text": bool(r.get("strip_all_text", False)),
                         "fallback_reupload": bool(r.get("fallback_reupload", True)),
                         "filters_count": len(r.get("skip_patterns") or [])
@@ -366,6 +367,7 @@ class WebConsole:
             "targets": _clean_peers(data.get("targets")),
             "drop_author": bool(data.get("drop_author", True)),
             "fallback_reupload": bool(data.get("fallback_reupload", True)),
+            "skip_text_only": bool(data.get("skip_text_only", False)),
             "strip_all_text": bool(data.get("strip_all_text", False)),
             "skip_empty_text_only": bool(data.get("skip_empty_text_only", True)),
             "disable_link_preview": bool(data.get("disable_link_preview", False)),

@@ -67,11 +67,13 @@ def test_strip_all_text_still_runs_skip_filter() -> None:
         {
             "name": "ad_img",
             "account_id": "acct_2",
+            "skip_text_only": True,
             "strip_all_text": True,
             "skip_patterns": ["(?i)广告|推广"],
             "strip_text_patterns": ["(?i)仅发图"],
         }
     )
+    assert rule.skip_text_only is True
     assert rule.strip_all_text is True
     assert rule.account_id == "acct_2"
     assert should_skip_text("独家推广图片，点击购买", rule) is not None

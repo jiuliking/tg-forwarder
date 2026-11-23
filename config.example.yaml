@@ -21,6 +21,7 @@ rules:
       - -1009876543210
     drop_author: true
     fallback_reupload: true
+    skip_text_only: false
     strip_all_text: false
     skip_empty_text_only: true
     disable_link_preview: false

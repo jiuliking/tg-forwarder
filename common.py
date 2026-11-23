@@ -64,6 +64,7 @@ class CompiledRule:
     targets: list[int | str]
     drop_author: bool = True
     fallback_reupload: bool = True
+    skip_text_only: bool = False
     strip_all_text: bool = False
     skip_empty_text_only: bool = True
     disable_link_preview: bool = False
@@ -116,6 +117,7 @@ def compile_rule_dict(r: dict[str, Any], idx: int = 0) -> CompiledRule:
         targets=[normalize_peer(x) for x in (r.get("targets") or []) if str(x).strip()],
         drop_author=bool(r.get("drop_author", True)),
         fallback_reupload=bool(r.get("fallback_reupload", True)),
+        skip_text_only=bool(r.get("skip_text_only", False)),
         strip_all_text=bool(r.get("strip_all_text", False)),
         skip_empty_text_only=bool(r.get("skip_empty_text_only", True)),
         disable_link_preview=bool(r.get("disable_link_preview", False)),

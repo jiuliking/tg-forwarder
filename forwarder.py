@@ -329,6 +329,25 @@ class AccountRunner:
                     )
                     continue
 
+                if not has_real_media and rule.skip_text_only:
+                    log.info("[%s/%s] Skip text-only msg %s", self.account_name, rule.name, msg.id)
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=0,
+                        target_title="-",
+                        msg_id=msg.id,
+                        item_count=1,
+                        mode="skip_text_only",
+                        status="skipped",
+                        preview=raw_text or "[纯文字消息]",
+                        detail="已开启跳过纯文字消息",
+                    )
+                    continue
+
                 clear_caption = rule.strip_all_text or (should_strip_all_text(raw_text, rule) is not None)
                 if clear_caption:
                     cleaned_text, cleaned_entities, changed = "", None, bool(raw_text)

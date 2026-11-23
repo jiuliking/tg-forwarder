@@ -114,6 +114,7 @@
       cleaned: '<span class="badge info status">无下载清洗</span>',
       reupload: '<span class="badge warning status">下载重传</span>',
       skip_regex: '<span class="badge muted">广告拦截</span>',
+      skip_text_only: '<span class="badge muted">纯文字跳过</span>',
       skip_empty: '<span class="badge muted">空内容跳过</span>',
       skip_restricted: '<span class="badge warning">受限跳过</span>',
       skip_size: '<span class="badge warning">超限跳过</span>',
@@ -339,7 +340,7 @@
                     <strong>${esc(r.name)}</strong>
                     <span>[${esc(r.account_name)}] ${r.sources.length} 源 → ${r.targets.length} 目标 · ${r.filters_count} 过滤</span>
                   </div>
-                  <span class="badge ${r.strip_all_text ? 'warning' : r.drop_author ? 'success' : 'muted'}">${r.strip_all_text ? '仅媒体' : r.drop_author ? '无来源' : '带来源'}</span>
+                  <span class="badge ${r.strip_all_text ? 'warning' : r.skip_text_only ? 'info' : r.drop_author ? 'success' : 'muted'}">${r.strip_all_text ? '仅媒体' : r.skip_text_only ? '跳过纯文字' : r.drop_author ? '无来源' : '带来源'}</span>
                 </div>`
                     )
                     .join('')
@@ -497,6 +498,7 @@
                     <span class="badge info">账号: ${esc(accountName(r.account_id || 'default'))}</span>
                     ${r.drop_author !== false ? '<span class="badge info">无来源</span>' : ''}
                     ${r.fallback_reupload !== false ? '<span class="badge warning">受限重传</span>' : ''}
+                    ${r.skip_text_only ? '<span class="badge info">跳过纯文字</span>' : ''}
                     ${r.strip_all_text ? '<span class="badge warning">仅媒体</span>' : ''}
                   </div>
                 </div>
@@ -863,6 +865,7 @@
             <div class="form-grid">
               <label class="checkbox"><input id="rm-drop-author" type="checkbox" ${data.drop_author !== false ? 'checked' : ''} /> <span>无来源转发（去除“转发自”）</span></label>
               <label class="checkbox"><input id="rm-fallback" type="checkbox" ${data.fallback_reupload !== false ? 'checked' : ''} /> <span>禁止转发频道自动下载重传</span></label>
+              <label class="checkbox"><input id="rm-skip-text-only" type="checkbox" ${data.skip_text_only ? 'checked' : ''} /> <span>跳过纯文字消息（保留媒体配文）</span></label>
               <label class="checkbox"><input id="rm-strip-all-text" type="checkbox" ${data.strip_all_text ? 'checked' : ''} /> <span>去除全部文本（清空配文，仅发媒体）</span></label>
               <label class="checkbox"><input id="rm-skip-empty" type="checkbox" ${data.skip_empty_text_only !== false ? 'checked' : ''} /> <span>清洗后为空的纯文本跳过</span></label>
               <label class="checkbox"><input id="rm-no-preview" type="checkbox" ${data.disable_link_preview ? 'checked' : ''} /> <span>禁用链接网页预览</span></label>
@@ -980,10 +983,11 @@
           </div>
 
           <div class="guide-item">
-            <strong>3. 五个规则开关说明</strong>
+            <strong>3. 六个规则开关说明</strong>
             <ul class="guide-list">
               <li><b>无来源转发</b>：不显示「转发自 xxx」；普通频道零下载秒转，保留原排版与相册。</li>
               <li><b>禁止转发频道自动下载重传</b>：遇到保护内容频道时，自动缓存下载后再上传，传完清理缓存。</li>
+              <li><b>跳过纯文字消息（保留媒体配文）</b>：直接过滤掉没有图片/视频/文件的纯文字贴（含仅带网页预览的文字贴），同时<b>正常保留媒体帖的配文</b>（仍会经过正则清洗）。</li>
               <li><b>去除全部文本（清空配文，仅发媒体）</b>：清空图片/视频/文件配文只发媒体本身（纯文字贴自动跳过）。<b>注意：仍会先按原配文跑一遍「整条跳过正则」拦截广告图文，再清空文本发送！</b></li>
               <li><b>清洗后为空的纯文本跳过</b>：纯文字广告被正则删空后不发空白消息。</li>
               <li><b>禁用链接网页预览</b>：隐藏消息底部的链接大图摘要卡片。</li>
@@ -1311,6 +1315,7 @@
     d.enabled = g('rm-enabled').checked;
     d.drop_author = g('rm-drop-author').checked;
     d.fallback_reupload = g('rm-fallback').checked;
+    d.skip_text_only = g('rm-skip-text-only').checked;
     d.strip_all_text = g('rm-strip-all-text').checked;
     d.skip_empty_text_only = g('rm-skip-empty').checked;
     d.disable_link_preview = g('rm-no-preview').checked;
@@ -1485,6 +1490,7 @@
           targets: [],
           drop_author: true,
           fallback_reupload: true,
+          skip_text_only: false,
           strip_all_text: false,
           skip_empty_text_only: true,
           disable_link_preview: false,
