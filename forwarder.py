@@ -3,14 +3,22 @@ import logging
 import os
 import shutil
 import signal
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 from aiohttp import web
 from telethon import TelegramClient, events, utils
-from telethon.errors import ChatForwardsRestrictedError, FloodWaitError
-from telethon.tl.types import DocumentAttributeVideo, MessageMediaWebPage
+from telethon.errors import (
+    ChannelPrivateError,
+    ChatForwardsRestrictedError,
+    ChatInvalidError,
+    FloodWaitError,
+    MsgIdInvalidError,
+    RPCError,
+)
+from telethon.tl.types import DocumentAttributeVideo, MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage
 
 from common import (
     AccountConfig,
@@ -19,6 +27,7 @@ from common import (
     CompiledRule,
     DedupStore,
     HistoryStore,
+    build_media_chunks,
     clean_message_text,
     load_config,
     load_env_file,
@@ -66,6 +75,7 @@ class AccountRunner:
         self.chat_titles: dict[int, str] = {}
         self.chats_cache: list[dict[str, Any]] = []
         self._send_lock = asyncio.Lock()
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._handlers_attached = False
         self.listening = False
         self._listen_task: Optional[asyncio.Task[None]] = None
@@ -80,6 +90,10 @@ class AccountRunner:
 
     async def stop(self) -> None:
         self.listening = False
+        for t in list(self._bg_tasks):
+            if not t.done():
+                t.cancel()
+        self._bg_tasks.clear()
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
         if self.client.is_connected():
@@ -171,6 +185,38 @@ class AccountRunner:
     @staticmethod
     def _is_real_media(msg: Any) -> bool:
         return bool(msg.media) and not isinstance(msg.media, MessageMediaWebPage)
+
+    @staticmethod
+    def _media_bucket(msg: Any) -> str:
+        media = getattr(msg, "media", None)
+        if isinstance(media, MessageMediaPhoto):
+            return "pv"
+        if isinstance(media, MessageMediaDocument):
+            doc = getattr(media, "document", None)
+            mime = str(getattr(doc, "mime_type", "") or "").lower()
+            attrs = getattr(doc, "attributes", None) or []
+            is_sticker_or_voice = any(
+                type(a).__name__ in ("DocumentAttributeSticker", "DocumentAttributeAudio") and getattr(a, "voice", False)
+                for a in attrs
+            )
+            if is_sticker_or_voice:
+                return "single"
+            if mime.startswith("video/") or any(isinstance(a, DocumentAttributeVideo) for a in attrs):
+                return "pv"
+            return "doc"
+        return "single"
+
+    @staticmethod
+    def _is_channel_sender(msg: Any, source_id: int) -> bool:
+        if getattr(msg, "sender_id", None) == source_id:
+            return True
+        from_id = getattr(msg, "from_id", None)
+        if from_id is not None:
+            try:
+                return utils.get_peer_id(from_id) == source_id
+            except Exception:
+                return False
+        return False
 
     @staticmethod
     def _file_size_mb(msg: Any) -> float:
@@ -288,6 +334,349 @@ class AccountRunner:
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
+    def _schedule_comment_forward(
+        self,
+        chat: Any,
+        source_id: int,
+        source_title: str,
+        main_msgs: list[Any],
+        rule: CompiledRule,
+    ) -> None:
+        task = asyncio.create_task(
+            self._process_with_comments(chat, source_id, source_title, main_msgs, rule)
+        )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _fetch_channel_comment_batches(
+        self,
+        source_ent: Any,
+        source_id: int,
+        thread_msg_id: int,
+    ) -> tuple[list[list[Any]], str, Optional[list[Any]], float]:
+        batches: list[list[Any]] = []
+        group_idx: dict[int, int] = {}
+        first_text = ""
+        first_entities: Optional[list[Any]] = None
+        latest_ts = 0.0
+
+        try:
+            async for cm in self.client.iter_messages(source_ent, reply_to=thread_msg_id, reverse=True, limit=200):
+                if cm.id == thread_msg_id:
+                    continue
+                if not self._is_channel_sender(cm, source_id):
+                    continue
+                msg_ts = cm.date.timestamp() if getattr(cm, "date", None) else 0.0
+                if msg_ts > latest_ts:
+                    latest_ts = msg_ts
+                if not first_text and (cm.message or "").strip():
+                    first_text = cm.message
+                    first_entities = list(cm.entities) if cm.entities else None
+                if not self._is_real_media(cm):
+                    continue
+                gid = getattr(cm, "grouped_id", None)
+                if gid is not None:
+                    if gid in group_idx:
+                        batches[group_idx[gid]].append(cm)
+                    else:
+                        group_idx[gid] = len(batches)
+                        batches.append([cm])
+                else:
+                    batches.append([cm])
+        except (MsgIdInvalidError, ChatInvalidError, ChannelPrivateError) as exc:
+            log.debug("[%s] No discussion replies for %s/%s: %s", self.account_name, source_id, thread_msg_id, exc)
+        except RPCError as exc:
+            log.warning("[%s] Failed fetching comments for %s/%s: %s", self.account_name, source_id, thread_msg_id, exc)
+
+        return batches, first_text, first_entities, latest_ts
+
+    async def _process_with_comments(
+        self,
+        chat: Any,
+        source_id: int,
+        source_title: str,
+        main_msgs: list[Any],
+        rule: CompiledRule,
+    ) -> None:
+        if not self.enabled or not main_msgs:
+            return
+        lead_id = main_msgs[0].id
+        thread_msg_id = next((m.id for m in main_msgs if getattr(m, "replies", None)), lead_id)
+        wait_s = max(5, rule.comment_wait_seconds)
+        start_ts = time.time()
+        max_deadline = start_ts + wait_s + 60.0
+
+        await asyncio.sleep(wait_s)
+        if not self.enabled:
+            return
+
+        comment_batches, fb_text, fb_entities, latest_ts = await self._fetch_channel_comment_batches(
+            chat, source_id, thread_msg_id
+        )
+        while latest_ts > 0 and (time.time() - latest_ts) < 10.0 and time.time() < max_deadline:
+            await asyncio.sleep(5)
+            if not self.enabled:
+                return
+            comment_batches, fb_text, fb_entities, latest_ts = await self._fetch_channel_comment_batches(
+                chat, source_id, thread_msg_id
+            )
+
+        main_text_msg = next((m for m in main_msgs if (m.message or "").strip()), None)
+        if main_text_msg is not None:
+            chosen_text = main_text_msg.message or ""
+            chosen_entities = list(main_text_msg.entities) if main_text_msg.entities else None
+        elif fb_text:
+            chosen_text = fb_text
+            chosen_entities = fb_entities
+        else:
+            chosen_text = ""
+            chosen_entities = None
+
+        main_media = [m for m in main_msgs if self._is_real_media(m)]
+        all_batches = ([main_media] if main_media else []) + comment_batches
+        total_media = sum(len(b) for b in all_batches)
+        raw_preview = chosen_text or (f"[媒体 {total_media} 项]" if total_media else "[纯文字消息]")
+
+        async with self._send_lock:
+            matched_skip = should_skip_text(chosen_text, rule)
+            if matched_skip:
+                log.info("[%s/%s] Skip post+comments %s (matched %r)", self.account_name, rule.name, lead_id, matched_skip)
+                self.manager.history.record(
+                    account_id=self.account_id,
+                    account_name=self.account_name,
+                    rule_name=rule.name,
+                    source_id=source_id,
+                    source_title=source_title,
+                    target_id=0,
+                    target_title="-",
+                    msg_id=lead_id,
+                    item_count=max(1, total_media),
+                    mode="skip_regex",
+                    status="skipped",
+                    preview=raw_preview,
+                    detail=f"命中跳过正则: {matched_skip}",
+                )
+                return
+
+            if total_media == 0 and rule.skip_text_only:
+                log.info("[%s/%s] Skip text-only msg %s (no media in comments)", self.account_name, rule.name, lead_id)
+                self.manager.history.record(
+                    account_id=self.account_id,
+                    account_name=self.account_name,
+                    rule_name=rule.name,
+                    source_id=source_id,
+                    source_title=source_title,
+                    target_id=0,
+                    target_title="-",
+                    msg_id=lead_id,
+                    item_count=1,
+                    mode="skip_text_only",
+                    status="skipped",
+                    preview=raw_preview,
+                    detail="主帖与评论区均无媒体，已跳过纯文字消息",
+                )
+                return
+
+            clear_caption = rule.strip_all_text or (should_strip_all_text(chosen_text, rule) is not None)
+            if clear_caption:
+                cleaned_text, cleaned_entities = "", None
+            else:
+                cleaned_text, cleaned_entities, _ = clean_message_text(chosen_text, chosen_entities, rule)
+
+            if total_media == 0 and not cleaned_text.strip() and (rule.skip_empty_text_only or clear_caption):
+                self.manager.history.record(
+                    account_id=self.account_id,
+                    account_name=self.account_name,
+                    rule_name=rule.name,
+                    source_id=source_id,
+                    source_title=source_title,
+                    target_id=0,
+                    target_title="-",
+                    msg_id=lead_id,
+                    item_count=1,
+                    mode="skip_empty",
+                    status="skipped",
+                    preview=raw_preview,
+                    detail="清洗后为空文本",
+                )
+                return
+
+            chunks = build_media_chunks(all_batches, rule.comment_merge_mode, self._media_bucket, max_album=10)
+            clean_preview = cleaned_text or (f"[评论区合并 {total_media} 项]" if comment_batches else f"[媒体 {total_media} 项]")
+
+            for tgt in rule.targets:
+                target_ent = self.target_cache.get(tgt)
+                if target_ent is None:
+                    continue
+                target_id = utils.get_peer_id(target_ent)
+                target_title = self.chat_titles.get(target_id, str(tgt))
+                if self.manager.dedup.seen(source_id, lead_id, target_id, account_id=self.account_id):
+                    continue
+
+                mode = "comments_batch" if rule.comment_merge_mode == "keep_batches" else "comments_pack"
+                try:
+                    if total_media == 0:
+                        lead_msg = main_msgs[0]
+                        if self._is_noforwards(chat, [lead_msg]):
+                            if not rule.fallback_reupload:
+                                self.manager.history.record(
+                                    account_id=self.account_id,
+                                    account_name=self.account_name,
+                                    rule_name=rule.name,
+                                    source_id=source_id,
+                                    source_title=source_title,
+                                    target_id=target_id,
+                                    target_title=target_title,
+                                    msg_id=lead_id,
+                                    item_count=1,
+                                    mode="skip_restricted",
+                                    status="skipped",
+                                    preview=clean_preview,
+                                    detail="源频道禁止转发且未启用重传",
+                                )
+                                continue
+                        await self._call_with_flood_retry(
+                            lambda: self.client.send_message(
+                                target_ent,
+                                cleaned_text,
+                                formatting_entities=cleaned_entities,
+                                link_preview=(not rule.disable_link_preview)
+                                and isinstance(lead_msg.media, MessageMediaWebPage),
+                            )
+                        )
+                        mode = "cleaned"
+                    else:
+                        any_reuploaded = False
+                        aborted = False
+                        for c_idx, chunk in enumerate(chunks):
+                            cap = cleaned_text if c_idx == 0 else ""
+                            ents = cleaned_entities if c_idx == 0 else None
+                            restricted = self._is_noforwards(chat, chunk)
+                            if not restricted:
+                                try:
+                                    if len(chunk) == 1:
+                                        await self._call_with_flood_retry(
+                                            lambda m0=chunk[0], cp=cap, en=ents: self.client.send_file(
+                                                target_ent,
+                                                m0.media,
+                                                caption=cp,
+                                                formatting_entities=en,
+                                            )
+                                        )
+                                    else:
+                                        caps = [cap] + [""] * (len(chunk) - 1)
+                                        ents_l = [ents or []] + [[] for _ in chunk[1:]]
+                                        medias = [m.media for m in chunk]
+                                        await self._call_with_flood_retry(
+                                            lambda ml=medias, cps=caps, el=ents_l: self.client.send_file(
+                                                target_ent,
+                                                ml,
+                                                caption=cps,
+                                                formatting_entities=el,
+                                            )
+                                        )
+                                except ChatForwardsRestrictedError:
+                                    restricted = True
+
+                            if restricted:
+                                if not rule.fallback_reupload:
+                                    self.manager.history.record(
+                                        account_id=self.account_id,
+                                        account_name=self.account_name,
+                                        rule_name=rule.name,
+                                        source_id=source_id,
+                                        source_title=source_title,
+                                        target_id=target_id,
+                                        target_title=target_title,
+                                        msg_id=lead_id,
+                                        item_count=total_media,
+                                        mode="skip_restricted",
+                                        status="skipped",
+                                        preview=clean_preview,
+                                        detail="源频道禁止转发且未启用重传",
+                                    )
+                                    aborted = True
+                                    break
+                                any_reuploaded = True
+                                if len(chunk) == 1:
+                                    ok = await self._reupload_single(target_ent, chunk[0], cap, ents, rule)
+                                else:
+                                    caps = [cap] + [""] * (len(chunk) - 1)
+                                    ents_l = [ents or []] + [[] for _ in chunk[1:]]
+                                    ok = await self._reupload_album(target_ent, chunk, caps, ents_l)
+                                if not ok:
+                                    self.manager.history.record(
+                                        account_id=self.account_id,
+                                        account_name=self.account_name,
+                                        rule_name=rule.name,
+                                        source_id=source_id,
+                                        source_title=source_title,
+                                        target_id=target_id,
+                                        target_title=target_title,
+                                        msg_id=lead_id,
+                                        item_count=total_media,
+                                        mode="skip_size",
+                                        status="skipped",
+                                        preview=clean_preview,
+                                        detail="超出最大下载大小或下载为空",
+                                    )
+                                    aborted = True
+                                    break
+                        if aborted:
+                            continue
+                        if any_reuploaded:
+                            mode = "reupload"
+
+                    for m in main_msgs:
+                        self.manager.dedup.mark(source_id, m.id, target_id, account_id=self.account_id)
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=target_id,
+                        target_title=target_title,
+                        msg_id=lead_id,
+                        item_count=max(1, total_media),
+                        mode=mode,
+                        status="success",
+                        preview=clean_preview,
+                        detail=f"含评论区媒体 {sum(len(b) for b in comment_batches)} 项（{len(chunks)} 组）"
+                        if comment_batches
+                        else "",
+                    )
+                    log.info(
+                        "[%s/%s] Forwarded post %s (+%d comment items in %d chunks, %s -> %s, mode=%s)",
+                        self.account_name,
+                        rule.name,
+                        lead_id,
+                        sum(len(b) for b in comment_batches),
+                        len(chunks),
+                        source_id,
+                        target_id,
+                        mode,
+                    )
+                except Exception as exc:
+                    log.exception("[%s/%s] Failed post+comments %s -> %s: %s", self.account_name, rule.name, lead_id, tgt, exc)
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=target_id,
+                        target_title=target_title,
+                        msg_id=lead_id,
+                        item_count=max(1, total_media),
+                        mode=mode,
+                        status="error",
+                        preview=clean_preview,
+                        detail=str(exc),
+                    )
+                if self.manager.cfg.delay_seconds > 0:
+                    await asyncio.sleep(self.manager.cfg.delay_seconds)
+
     async def process_single(self, event: events.NewMessage.Event) -> None:
         if not self.enabled:
             return
@@ -307,8 +696,16 @@ class AccountRunner:
         orig_entities = list(msg.entities) if msg.entities else None
         has_real_media = self._is_real_media(msg)
 
+        is_broadcast = bool(getattr(chat, "broadcast", False))
+        comment_rules = [r for r in rules if r.collect_comments and is_broadcast]
+        normal_rules = [r for r in rules if not (r.collect_comments and is_broadcast)]
+        for rule in comment_rules:
+            self._schedule_comment_forward(chat, source_id, source_title, [msg], rule)
+        if not normal_rules:
+            return
+
         async with self._send_lock:
-            for rule in rules:
+            for rule in normal_rules:
                 matched_skip = should_skip_text(raw_text, rule)
                 if matched_skip:
                     log.info("[%s/%s] Skip msg %s (matched %r)", self.account_name, rule.name, msg.id, matched_skip)
@@ -517,8 +914,16 @@ class AccountRunner:
         lead_id = msgs[0].id
         raw_preview = next((m.message for m in msgs if m.message), "") or f"[相册 {len(msgs)} 项]"
 
+        is_broadcast = bool(getattr(chat, "broadcast", False))
+        comment_rules = [r for r in rules if r.collect_comments and is_broadcast]
+        normal_rules = [r for r in rules if not (r.collect_comments and is_broadcast)]
+        for rule in comment_rules:
+            self._schedule_comment_forward(chat, source_id, source_title, msgs, rule)
+        if not normal_rules:
+            return
+
         async with self._send_lock:
-            for rule in rules:
+            for rule in normal_rules:
                 skip_hit = None
                 for m in msgs:
                     skip_hit = should_skip_text(m.message or "", rule)

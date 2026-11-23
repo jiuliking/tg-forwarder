@@ -68,6 +68,9 @@ class CompiledRule:
     strip_all_text: bool = False
     skip_empty_text_only: bool = True
     disable_link_preview: bool = False
+    collect_comments: bool = False
+    comment_wait_seconds: int = 30
+    comment_merge_mode: str = "pack"
     skip_patterns: list[re.Pattern[str]] = field(default_factory=list)
     strip_text_patterns: list[re.Pattern[str]] = field(default_factory=list)
     strip_patterns: list[re.Pattern[str]] = field(default_factory=list)
@@ -123,6 +126,11 @@ def compile_rule_dict(r: dict[str, Any], idx: int = 0) -> CompiledRule:
         strip_all_text=bool(r.get("strip_all_text", False)),
         skip_empty_text_only=bool(r.get("skip_empty_text_only", True)),
         disable_link_preview=bool(r.get("disable_link_preview", False)),
+        collect_comments=bool(r.get("collect_comments", False)),
+        comment_wait_seconds=max(5, min(300, int(r.get("comment_wait_seconds", 30) or 30))),
+        comment_merge_mode=(
+            "keep_batches" if str(r.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
+        ),
         skip_patterns=_compile_patterns(r.get("skip_patterns"), f"{name}.skip_patterns"),
         strip_text_patterns=_compile_patterns(r.get("strip_text_patterns"), f"{name}.strip_text_patterns"),
         strip_patterns=_compile_patterns(r.get("strip_patterns"), f"{name}.strip_patterns"),
@@ -326,6 +334,47 @@ def clean_message_text(
             out_entities.append(ent)
 
     return cur_text, (out_entities or None), True
+
+
+def build_media_chunks(
+    batches: Sequence[Sequence[Any]],
+    mode: str,
+    bucket_fn,
+    max_album: int = 10,
+) -> list[list[Any]]:
+    def _split_compatible(items: Sequence[Any]) -> list[list[Any]]:
+        out: list[list[Any]] = []
+        cur: list[Any] = []
+        cur_bucket: Optional[str] = None
+        for item in items:
+            b = bucket_fn(item)
+            if b == "single":
+                if cur:
+                    out.append(cur)
+                    cur = []
+                    cur_bucket = None
+                out.append([item])
+                continue
+            if cur and (cur_bucket != b or len(cur) >= max_album):
+                out.append(cur)
+                cur = []
+            cur.append(item)
+            cur_bucket = b
+        if cur:
+            out.append(cur)
+        return out
+
+    if mode == "keep_batches":
+        chunks: list[list[Any]] = []
+        for batch in batches:
+            if batch:
+                chunks.extend(_split_compatible(batch))
+        return chunks
+
+    flat: list[Any] = []
+    for batch in batches:
+        flat.extend(batch)
+    return _split_compatible(flat)
 
 
 class DedupStore:

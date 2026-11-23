@@ -116,6 +116,8 @@
       copy: '<span class="badge success status">无来源秒转</span>',
       cleaned: '<span class="badge info status">无下载清洗</span>',
       reupload: '<span class="badge warning status">下载重传</span>',
+      comments_pack: '<span class="badge info status">评论合并</span>',
+      comments_batch: '<span class="badge info status">评论分批</span>',
       skip_regex: '<span class="badge muted">广告拦截</span>',
       skip_text_only: '<span class="badge muted">纯文字跳过</span>',
       skip_empty: '<span class="badge muted">空内容跳过</span>',
@@ -505,6 +507,7 @@
                     ${r.drop_author !== false ? '<span class="badge info">无来源</span>' : ''}
                     ${r.fallback_reupload !== false ? '<span class="badge warning">受限重传</span>' : ''}
                     ${r.skip_text_only ? '<span class="badge info">跳过纯文字</span>' : ''}
+                    ${r.collect_comments ? `<span class="badge info">抓评论区(${r.comment_merge_mode === 'keep_batches' ? '按原批' : '凑满'})</span>` : ''}
                     ${r.strip_all_text ? '<span class="badge warning">仅媒体</span>' : ''}
                   </div>
                 </div>
@@ -985,7 +988,27 @@
               <label class="checkbox"><input id="rm-strip-all-text" type="checkbox" ${data.strip_all_text ? 'checked' : ''} /> <span>去除全部文本（清空配文，仅发媒体）</span></label>
               <label class="checkbox"><input id="rm-skip-empty" type="checkbox" ${data.skip_empty_text_only !== false ? 'checked' : ''} /> <span>清洗后为空的纯文本跳过</span></label>
               <label class="checkbox"><input id="rm-no-preview" type="checkbox" ${data.disable_link_preview ? 'checked' : ''} /> <span>禁用链接网页预览</span></label>
+              <label class="checkbox span-full"><input id="rm-collect-comments" type="checkbox" ${data.collect_comments ? 'checked' : ''} /> <span>抓取评论区频道马甲媒体（主帖有字以主帖为准，主帖无字取首条作者评论）</span></label>
             </div>
+
+            ${
+              data.collect_comments
+                ? `<div class="form-grid" style="padding:12px 14px;background:var(--paper);border:1px solid var(--line);border-radius:10px">
+                     <div class="field">
+                       <label>评论区等待收集窗口（秒）</label>
+                       <input id="rm-comment-wait" type="number" min="5" max="300" value="${esc(data.comment_wait_seconds ?? 30)}" />
+                       <span class="hint">若作者仍在继续发图，会自动顺延至停发后 10 秒（最多顺延 60 秒）</span>
+                     </div>
+                     <div class="field">
+                       <label>媒体分组发送方式</label>
+                       <select id="rm-comment-mode">
+                         <option value="pack" ${(data.comment_merge_mode || 'pack') === 'pack' ? 'selected' : ''}>自动凑满（主帖与评论合并，每组最多 10 项）</option>
+                         <option value="keep_batches" ${data.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>按原批次发送（保持主帖与每条评论各自数量）</option>
+                       </select>
+                     </div>
+                   </div>`
+                : ''
+            }
 
             <div class="field">
               <label>整条跳过正则（skip_patterns，每行一条）</label>
@@ -1107,6 +1130,7 @@
               <li><b>去除全部文本（清空配文，仅发媒体）</b>：清空图片/视频/文件配文只发媒体本身（纯文字贴自动跳过）。<b>注意：仍会先按原配文跑一遍「整条跳过正则」拦截广告图文，再清空文本发送！</b></li>
               <li><b>清洗后为空的纯文本跳过</b>：纯文字广告被正则删空后不发空白消息。</li>
               <li><b>禁用链接网页预览</b>：隐藏消息底部的链接大图摘要卡片。</li>
+              <li><b>抓取评论区频道马甲媒体</b>：开启后主帖发布先异步等待设定窗口，仅抓取评论区里以「频道自身身份」发的图片/视频，支持「自动凑满（每组最多 10 项）」或「按原批次发送」；文字以主帖优先，主帖无字时自动取首条有文字的频道马甲评论。</li>
             </ul>
           </div>
 
@@ -1436,6 +1460,9 @@
     d.strip_all_text = g('rm-strip-all-text').checked;
     d.skip_empty_text_only = g('rm-skip-empty').checked;
     d.disable_link_preview = g('rm-no-preview').checked;
+    d.collect_comments = g('rm-collect-comments').checked;
+    if (g('rm-comment-wait')) d.comment_wait_seconds = Math.max(5, Math.min(300, Number(g('rm-comment-wait').value) || 30));
+    if (g('rm-comment-mode')) d.comment_merge_mode = g('rm-comment-mode').value || 'pack';
     d.skip_patterns = g('rm-skip').value.split('\n').map((s) => s.trim()).filter(Boolean);
     d.strip_text_patterns = g('rm-strip-all-on-match').value.split('\n').map((s) => s.trim()).filter(Boolean);
     d.strip_patterns = g('rm-strip').value.split('\n').map((s) => s.trim()).filter(Boolean);
@@ -1612,6 +1639,9 @@
           strip_all_text: false,
           skip_empty_text_only: true,
           disable_link_preview: false,
+          collect_comments: false,
+          comment_wait_seconds: 30,
+          comment_merge_mode: 'pack',
           skip_patterns: [],
           strip_text_patterns: [],
           strip_patterns: [],
@@ -1683,6 +1713,13 @@
       document.querySelectorAll('[data-rm-del-tgt]').forEach((b) => {
         b.onclick = () => { syncRuleModalFromDom(); state.modalRule.data.targets.splice(Number(b.dataset.rmDelTgt), 1); render(); };
       });
+      const rmCollectComments = document.getElementById('rm-collect-comments');
+      if (rmCollectComments) {
+        rmCollectComments.onchange = () => {
+          syncRuleModalFromDom();
+          render();
+        };
+      }
       const bindPickerButtons = () => {
         document.querySelectorAll('[data-pick-src]').forEach((b) => {
           b.onclick = () => {

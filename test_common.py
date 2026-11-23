@@ -7,6 +7,7 @@ from common import (
     AuthStore,
     DedupStore,
     HistoryStore,
+    build_media_chunks,
     clean_message_text,
     compile_rule_dict,
     load_config,
@@ -164,6 +165,15 @@ def test_stores_and_config_roundtrip() -> None:
         assert loaded.delay_seconds == 1.5
         assert len(loaded.accounts) == 2
         assert loaded.rules[0].account_id == "acct_2"
+
+        # Test comment chunking modes: pack vs keep_batches
+        batches = [["p1"], ["p2", "p3", "p4", "p5", "p6", "p7"], ["p8", "p9", "p10", "p11", "p12", "p13"]]
+        packed = build_media_chunks(batches, "pack", lambda _x: "pv", max_album=10)
+        assert [len(c) for c in packed] == [10, 3]
+        kept = build_media_chunks(batches, "keep_batches", lambda _x: "pv", max_album=10)
+        assert [len(c) for c in kept] == [1, 6, 6]
+        mixed = build_media_chunks([["p1", "d1", "d2", "p2"]], "pack", lambda x: "pv" if x.startswith("p") else "doc", max_album=10)
+        assert mixed == [["p1"], ["d1", "d2"], ["p2"]]
 
 
 if __name__ == "__main__":

@@ -418,6 +418,11 @@ class WebConsole:
             "strip_all_text": bool(data.get("strip_all_text", False)),
             "skip_empty_text_only": bool(data.get("skip_empty_text_only", True)),
             "disable_link_preview": bool(data.get("disable_link_preview", False)),
+            "collect_comments": bool(data.get("collect_comments", False)),
+            "comment_wait_seconds": max(5, min(300, int(data.get("comment_wait_seconds") or 30))),
+            "comment_merge_mode": (
+                "keep_batches" if str(data.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
+            ),
             "skip_patterns": _clean_patterns(data.get("skip_patterns")),
             "strip_text_patterns": _clean_patterns(data.get("strip_text_patterns")),
             "strip_patterns": _clean_patterns(data.get("strip_patterns")),
