@@ -325,6 +325,53 @@ class WebConsole:
         accounts = [{"id": a["id"], "name": a["name"]} for a in (raw.get("accounts") or [])]
         return web.json_response({"items": rows, "rules": rule_names, "accounts": accounts})
 
+    async def handle_logs_manage_get(self, _request: web.Request) -> web.Response:
+        raw = load_raw_config(self.config_path)
+        g = raw.get("global") or {}
+        retention_days = max(0, int(g.get("log_retention_days", 30)))
+        max_rows = max(100, int(g.get("log_max_rows", 5000)))
+        return web.json_response(
+            {
+                "log_retention_days": retention_days,
+                "log_max_rows": max_rows,
+                "stats": self.manager.history.stats_detail(),
+            }
+        )
+
+    async def handle_logs_manage_put(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        raw = load_raw_config(self.config_path)
+        g = raw.setdefault("global", {})
+        if "log_retention_days" in data:
+            g["log_retention_days"] = max(0, int(data.get("log_retention_days", 30)))
+        if "log_max_rows" in data:
+            g["log_max_rows"] = max(100, int(data.get("log_max_rows", 5000)))
+        save_raw_config(self.config_path, raw)
+        await self.manager.reload_all(force=True)
+        pruned = self.manager.history.prune(
+            max(0, int(g.get("log_retention_days", 30))),
+            max(100, int(g.get("log_max_rows", 5000))),
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                "pruned": pruned,
+                "log_retention_days": max(0, int(g.get("log_retention_days", 30))),
+                "log_max_rows": max(100, int(g.get("log_max_rows", 5000))),
+                "stats": self.manager.history.stats_detail(),
+            }
+        )
+
+    async def handle_logs_prune(self, _request: web.Request) -> web.Response:
+        deleted = self.manager.history.prune()
+        return web.json_response({"ok": True, "deleted": deleted, "stats": self.manager.history.stats_detail()})
+
+    async def handle_logs_clear(self, request: web.Request) -> web.Response:
+        data = await request.json() if request.can_read_body else {}
+        status = str((data or {}).get("status") or "").strip()
+        deleted = self.manager.history.clear(status)
+        return web.json_response({"ok": True, "deleted": deleted, "stats": self.manager.history.stats_detail()})
+
     async def handle_rules_list(self, _request: web.Request) -> web.Response:
         raw = load_raw_config(self.config_path)
         accounts = [{"id": a["id"], "name": a["name"], "enabled": bool(a.get("enabled", True))} for a in (raw.get("accounts") or [])]
@@ -735,6 +782,10 @@ class WebConsole:
 
         app.router.add_get("/api/overview", self.handle_overview)
         app.router.add_get("/api/logs", self.handle_logs)
+        app.router.add_get("/api/logs/manage", self.handle_logs_manage_get)
+        app.router.add_put("/api/logs/manage", self.handle_logs_manage_put)
+        app.router.add_post("/api/logs/prune", self.handle_logs_prune)
+        app.router.add_post("/api/logs/clear", self.handle_logs_clear)
         app.router.add_get("/api/rules", self.handle_rules_list)
         app.router.add_post("/api/rules", self.handle_rule_create)
         app.router.add_put("/api/rules/{idx}", self.handle_rule_update)

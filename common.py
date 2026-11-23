@@ -82,6 +82,8 @@ class AppConfig:
     dedup_ttl_hours: int
     accounts: list[AccountConfig]
     rules: list[CompiledRule]
+    log_retention_days: int = 30
+    log_max_rows: int = 5000
 
 
 def _compile_patterns(items: Sequence[str] | None, field_name: str) -> list[re.Pattern[str]]:
@@ -185,6 +187,8 @@ def load_config(config_path: Path) -> AppConfig:
         dedup_ttl_hours=int(g.get("dedup_ttl_hours", 48)),
         accounts=accounts_out,
         rules=rules_out,
+        log_retention_days=max(0, int(g.get("log_retention_days", 30))),
+        log_max_rows=max(100, int(g.get("log_max_rows", 5000))),
     )
 
 
@@ -373,7 +377,10 @@ class DedupStore:
 
 
 class HistoryStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, retention_days: int = 30, max_rows: int = 5000) -> None:
+        self.db_path = Path(db_path)
+        self.retention_days = max(0, int(retention_days))
+        self.max_rows = max(100, int(max_rows))
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(
@@ -446,10 +453,66 @@ class HistoryStore:
                 (detail or "")[:400],
             ),
         )
-        self.conn.execute(
-            "DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT 5000)"
-        )
+        self._apply_prune_sql(self.retention_days, self.max_rows)
         self.conn.commit()
+
+    def _apply_prune_sql(self, retention_days: int, max_rows: int) -> int:
+        deleted = 0
+        if retention_days > 0:
+            cutoff = int(time.time()) - retention_days * 86400
+            cur = self.conn.execute("DELETE FROM history WHERE ts < ?", (cutoff,))
+            deleted += cur.rowcount or 0
+        if max_rows > 0:
+            cur = self.conn.execute(
+                "DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT ?)",
+                (max_rows,),
+            )
+            deleted += cur.rowcount or 0
+        return deleted
+
+    def prune(self, retention_days: Optional[int] = None, max_rows: Optional[int] = None) -> int:
+        days = self.retention_days if retention_days is None else max(0, int(retention_days))
+        rows = self.max_rows if max_rows is None else max(100, int(max_rows))
+        deleted = self._apply_prune_sql(days, rows)
+        self.conn.commit()
+        return deleted
+
+    def clear(self, status: str = "") -> int:
+        st = str(status or "").strip()
+        if st in ("success", "skipped", "error"):
+            cur = self.conn.execute("DELETE FROM history WHERE status = ?", (st,))
+        else:
+            cur = self.conn.execute("DELETE FROM history")
+        deleted = cur.rowcount or 0
+        self.conn.commit()
+        return deleted
+
+    def stats_detail(self) -> dict[str, Any]:
+        row = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_count,
+                COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END), 0) AS success_count,
+                COALESCE(SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END), 0) AS skipped_count,
+                COALESCE(SUM(CASE WHEN status='error' THEN 1 ELSE 0 END), 0) AS error_count,
+                MIN(ts) AS oldest_ts,
+                MAX(ts) AS newest_ts
+            FROM history
+            """
+        ).fetchone()
+        try:
+            db_size = self.db_path.stat().st_size
+        except OSError:
+            db_size = 0
+        return {
+            "total_count": int(row["total_count"] or 0),
+            "success_count": int(row["success_count"] or 0),
+            "skipped_count": int(row["skipped_count"] or 0),
+            "error_count": int(row["error_count"] or 0),
+            "oldest_ts": int(row["oldest_ts"]) if row["oldest_ts"] is not None else None,
+            "newest_ts": int(row["newest_ts"]) if row["newest_ts"] is not None else None,
+            "db_size_bytes": db_size,
+        }
 
     def recent(self, limit: int = 50, status: str = "", rule: str = "", account_id: str = "") -> list[dict[str, Any]]:
         clauses = []

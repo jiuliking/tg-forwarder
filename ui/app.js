@@ -20,6 +20,7 @@
     phoneStep: 'input',
     phoneNum: '',
     settings: null,
+    logManage: null,
     modalRule: null, // null | { idx, data, chats }
     modalPickerQuery: '',
     modalPassword: false,
@@ -94,6 +95,7 @@
       dashboard: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>`,
       guide: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>`,
       logs: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h10"/></svg>`,
+      logManage: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/></svg>`,
       rules: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>`,
       chats: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`,
       telegram: `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>`,
@@ -203,6 +205,8 @@
         }
       } else if (path === '/settings') {
         state.settings = await api('/api/settings');
+      } else if (path === '/log-manage') {
+        state.logManage = await api('/api/logs/manage');
       }
       render();
     } catch (e) {
@@ -392,6 +396,7 @@
           <p class="page-sub">展示最近的转发、广告跳过与受限重传记录</p>
         </div>
         <div class="page-actions">
+          <button class="btn" data-nav="/log-manage">日志管理</button>
           <button class="btn primary" id="btn-refresh-logs">刷新</button>
         </div>
       </div>
@@ -441,7 +446,7 @@
                     <td>${esc(it.source_title)} → ${esc(it.target_title)}</td>
                     <td>
                       <div>${esc(it.preview || '[媒体消息]')}</div>
-                      ${it.detail ? `<div class="hint" style="color:var(--danger)">${esc(it.detail)}</div>` : ''}
+                      ${it.detail ? `<div class="hint" style="color:${it.status === 'error' ? 'var(--danger)' : 'var(--text-3)'}">${esc(it.detail)}</div>` : ''}
                     </td>
                   </tr>`
                     )
@@ -785,6 +790,82 @@
         <div class="actions" style="margin-top:14px">
           <button class="btn" data-copy="${esc(tokenUrl)}">复制直达链接</button>
           <button class="btn danger" id="btn-rotate-token">重置 Token</button>
+        </div>
+      </section>`;
+  }
+
+  function renderLogManage() {
+    const lm = state.logManage;
+    if (!lm) return '<div class="panel empty">加载日志统计中...</div>';
+    const st = lm.stats || {};
+    const dbKb = ((st.db_size_bytes || 0) / 1024).toFixed(1);
+    const oldest = st.oldest_ts ? fmtTime(st.oldest_ts) : '暂无';
+    return `
+      <div class="page-head">
+        <div>
+          <h1>日志管理</h1>
+          <p class="page-sub">设置转发与拦截记录的保留时长、条数上限，或按需手动清理历史日志</p>
+        </div>
+        <div class="page-actions">
+          <button class="btn" data-nav="/logs">查看转发记录</button>
+          <button class="btn primary" id="btn-refresh-log-manage">刷新统计</button>
+        </div>
+      </div>
+
+      <section class="metrics-row">
+        <div class="metric-card">
+          <span>总记录数</span>
+          <strong>${st.total_count || 0}</strong>
+          <small>数据库 ${dbKb} KB</small>
+        </div>
+        <div class="metric-card">
+          <span>成功转发</span>
+          <strong>${st.success_count || 0}</strong>
+          <small>正常发出记录</small>
+        </div>
+        <div class="metric-card">
+          <span>已拦截 / 跳过</span>
+          <strong>${st.skipped_count || 0}</strong>
+          <small>广告、纯文字或受限跳过</small>
+        </div>
+        <div class="metric-card">
+          <span>失败 / 最早记录</span>
+          <strong>${st.error_count || 0}</strong>
+          <small>最早：${esc(oldest)}</small>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2 class="panel-title">日志保留策略</h2></div>
+        <form id="log-manage-form" class="form-grid">
+          <div class="field">
+            <label>日志保留时长（天）</label>
+            <input id="lm-days" type="number" min="0" value="${esc(lm.log_retention_days)}" />
+            <span class="hint">填 0 表示不按天数过期；新写入日志及服务重载时会自动清理超出天数的旧记录</span>
+          </div>
+          <div class="field">
+            <label>最多保留条数</label>
+            <input id="lm-maxrows" type="number" min="100" step="100" value="${esc(lm.log_max_rows)}" />
+            <span class="hint">按时间顺序只保留最新 N 条（最低 100 条），防止日志表无限膨胀</span>
+          </div>
+          <div class="span-full actions">
+            <button type="button" class="btn small" data-lm-preset-days="7">7 天</button>
+            <button type="button" class="btn small" data-lm-preset-days="30">30 天</button>
+            <button type="button" class="btn small" data-lm-preset-days="90">90 天</button>
+            <button type="button" class="btn small" data-lm-preset-days="0">永久保留 (0)</button>
+            <button class="btn primary" type="submit" style="margin-left:auto">保存保留策略并应用</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2 class="panel-title">手动清理日志</h2></div>
+        <p class="hint" style="margin:0 0 14px">清理仅删除历史记录（转发记录/拦截记录），不会影响去重记录、账号登录状态或转发规则。</p>
+        <div class="actions">
+          <button type="button" class="btn" id="btn-prune-logs">按当前策略清理过期日志</button>
+          <button type="button" class="btn" data-clear-logs="skipped">仅清空已拦截/跳过记录</button>
+          <button type="button" class="btn" data-clear-logs="error">仅清空失败记录</button>
+          <button type="button" class="btn danger" data-clear-logs="">清空全部日志</button>
         </div>
       </section>`;
   }
@@ -1265,7 +1346,7 @@
     const navGroups = [
       { label: '工作台', items: [['/', '概览', 'dashboard'], ['/rules', '转发规则', 'rules'], ['/chats', '频道目录', 'chats']] },
       { label: '连接与记录', items: [['/telegram', 'Telegram 账号', 'telegram'], ['/logs', '转发记录', 'logs']] },
-      { label: '系统与帮助', items: [['/settings', '全局设置', 'settings'], ['/regex', '正则生成', 'regex'], ['/guide', '使用说明', 'guide']] },
+      { label: '系统与帮助', items: [['/settings', '全局设置', 'settings'], ['/log-manage', '日志管理', 'logManage'], ['/regex', '正则生成', 'regex'], ['/guide', '使用说明', 'guide']] },
     ];
     const authCnt = (state.accounts || []).filter((a) => a.authorized).length;
     const totalCnt = (state.accounts || []).length;
@@ -1275,6 +1356,7 @@
     else if (state.route === '/regex') bodyHtml = renderRegexHelper();
     else if (state.route === '/guide') bodyHtml = renderGuide();
     else if (state.route === '/logs') bodyHtml = renderLogs();
+    else if (state.route === '/log-manage') bodyHtml = renderLogManage();
     else if (state.route === '/rules') bodyHtml = renderRules();
     else if (state.route === '/chats') bodyHtml = renderChats();
     else if (state.route === '/telegram') bodyHtml = renderTelegram();
@@ -1959,6 +2041,64 @@
         render();
       };
     }
+
+    // Log management page
+    const btnRefreshLm = document.getElementById('btn-refresh-log-manage');
+    if (btnRefreshLm) btnRefreshLm.onclick = () => loadRouteData('/log-manage');
+    document.querySelectorAll('[data-lm-preset-days]').forEach((b) => {
+      b.onclick = () => {
+        const el = document.getElementById('lm-days');
+        if (el) el.value = b.dataset.lmPresetDays;
+      };
+    });
+    const lmForm = document.getElementById('log-manage-form');
+    if (lmForm) {
+      lmForm.onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          const r = await api('/api/logs/manage', {
+            method: 'PUT',
+            body: JSON.stringify({
+              log_retention_days: Number(document.getElementById('lm-days').value),
+              log_max_rows: Number(document.getElementById('lm-maxrows').value),
+            }),
+          });
+          state.logManage = r;
+          toast(`日志策略已保存${r.pruned ? `，并清理了 ${r.pruned} 条过期日志` : ''}`, 'success');
+          render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
+      };
+    }
+    const btnPruneLogs = document.getElementById('btn-prune-logs');
+    if (btnPruneLogs) {
+      btnPruneLogs.onclick = async () => {
+        try {
+          const r = await api('/api/logs/prune', { method: 'POST' });
+          if (state.logManage) state.logManage.stats = r.stats;
+          toast(`已清理 ${r.deleted || 0} 条过期/超限日志`, 'success');
+          render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
+      };
+    }
+    document.querySelectorAll('[data-clear-logs]').forEach((b) => {
+      b.onclick = async () => {
+        const st = b.dataset.clearLogs || '';
+        const label = st === 'skipped' ? '所有已拦截/跳过记录' : st === 'error' ? '所有失败记录' : '全部历史日志';
+        if (!confirm(`确定要清空${label}吗？此操作不可恢复。`)) return;
+        try {
+          const r = await api('/api/logs/clear', { method: 'POST', body: JSON.stringify({ status: st }) });
+          if (state.logManage) state.logManage.stats = r.stats;
+          toast(`已清空 ${r.deleted || 0} 条记录`, 'success');
+          render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
+      };
+    });
 
     // Regex helper controls
     const rgMode = document.getElementById('rg-mode');

@@ -2,6 +2,8 @@ global:
   delay_seconds: 1.0
   max_download_mb: 2000
   dedup_ttl_hours: 48
+  log_retention_days: 30
+  log_max_rows: 5000
   # Optional: override .env Telegram API credentials from Web UI or here
   # api_id: 12345678
   # api_hash: "0123456789abcdef0123456789abcdef"

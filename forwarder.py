@@ -702,7 +702,12 @@ class ForwarderManager:
         self.cfg_mtime: float = CONFIG_PATH.stat().st_mtime if CONFIG_PATH.exists() else 0.0
         self.dedup = DedupStore(STATE_DB_PATH)
         self.dedup.prune(self.cfg.dedup_ttl_hours)
-        self.history = HistoryStore(STATE_DB_PATH)
+        self.history = HistoryStore(
+            STATE_DB_PATH,
+            retention_days=self.cfg.log_retention_days,
+            max_rows=self.cfg.log_max_rows,
+        )
+        self.history.prune()
         self.runners: dict[str, AccountRunner] = {}
         self._reload_lock = asyncio.Lock()
 
@@ -730,6 +735,10 @@ class ForwarderManager:
             new_cfg.temp_dir.mkdir(parents=True, exist_ok=True)
             self.cfg = new_cfg
             self.cfg_mtime = mtime
+            self.history.retention_days = new_cfg.log_retention_days
+            self.history.max_rows = new_cfg.log_max_rows
+            self.history.prune()
+            self.dedup.prune(new_cfg.dedup_ttl_hours)
 
             desired = {a.id: a for a in new_cfg.accounts}
             for old_id in list(self.runners.keys()):

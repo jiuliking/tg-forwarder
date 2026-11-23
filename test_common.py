@@ -121,6 +121,28 @@ def test_stores_and_config_roundtrip() -> None:
         st = hist.stats_and_activity()
         assert st["total_success"] == 1 and len(st["activity_7d"]) == 7
 
+        hist.record(
+            account_id="acct_2",
+            account_name="小号2",
+            rule_name="r1",
+            source_id=-1001,
+            source_title="Src",
+            target_id=0,
+            target_title="-",
+            msg_id=43,
+            item_count=1,
+            mode="skip_regex",
+            status="skipped",
+            preview="ad",
+            detail="命中跳过正则",
+        )
+        detail = hist.stats_detail()
+        assert detail["total_count"] == 2 and detail["skipped_count"] == 1
+        assert hist.clear("skipped") == 1
+        assert hist.stats_detail()["total_count"] == 1
+        assert hist.clear("") == 1
+        assert hist.stats_detail()["total_count"] == 0
+
         auth = AuthStore(db_path)
         assert auth.generated_password is not None
         assert auth.verify_password(auth.generated_password) is True
