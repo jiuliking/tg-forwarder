@@ -21,6 +21,7 @@
     phoneNum: '',
     settings: null,
     modalRule: null, // null | { idx, data, chats }
+    modalPickerQuery: '',
     modalPassword: false,
     modalAddAccount: false,
     testInput: '🔥频道推荐内容\n这是一段正文，包含重要信息\n\n关注备用频道 @example_ad_channel',
@@ -788,6 +789,48 @@
       </section>`;
   }
 
+  function isPeerSelected(list, chat) {
+    const idStr = String(chat.id);
+    const uname = chat.username ? '@' + chat.username.toLowerCase() : '';
+    return (list || []).some((x) => {
+      const s = String(x).trim();
+      return s === idStr || (uname && s.toLowerCase() === uname);
+    });
+  }
+
+  function renderPickerItemsHtml(chatList, data, query) {
+    const q = String(query || '').trim().toLowerCase();
+    const filtered = q
+      ? chatList.filter((c) => {
+          const t = `${c.title || ''} ${c.id || ''} ${c.username || ''}`.toLowerCase();
+          return t.includes(q);
+        })
+      : chatList;
+    if (!filtered.length) return '<div class="hint" style="padding:12px 4px">没有匹配的频道或群组</div>';
+    return filtered
+      .map((c) => {
+        const isSrc = isPeerSelected(data.sources, c);
+        const isTgt = isPeerSelected(data.targets, c);
+        const kindLabel = c.kind === 'channel' ? '频道' : c.kind === 'supergroup' ? '超级群' : '群组';
+        return `
+          <div class="picker-item ${isSrc || isTgt ? 'is-selected' : ''}">
+            <div class="picker-item-meta">
+              <span>${esc(c.title)}</span>
+              <span class="badge muted">${kindLabel}</span>
+              <span class="mono muted">${esc(c.id)}</span>
+              ${c.noforwards ? '<span class="badge warning">禁转发</span>' : ''}
+              ${isSrc ? '<span class="badge info">✓ 已选为源</span>' : ''}
+              ${isTgt ? '<span class="badge success">✓ 已选为目标</span>' : ''}
+            </div>
+            <span class="actions" style="flex-shrink:0">
+              <button type="button" class="btn small ${isSrc ? 'picked-src' : ''}" data-pick-src="${esc(c.id)}">${isSrc ? '✓ 源' : '+ 源'}</button>
+              <button type="button" class="btn small ${isTgt ? 'picked-tgt' : ''}" data-pick-tgt="${esc(c.id)}">${isTgt ? '✓ 目标' : '+ 目标'}</button>
+            </span>
+          </div>`;
+      })
+      .join('');
+  }
+
   function renderRuleModal() {
     if (!state.modalRule) return '';
     const { idx, data, chats } = state.modalRule;
@@ -843,20 +886,12 @@
             ${
               chatList.length
                 ? `<div class="field">
-                     <label>从「${esc(accountName(data.account_id || 'default'))}」已加入频道快速勾选</label>
-                     <div class="picker-box">
-                       ${chatList
-                         .map(
-                           (c) => `
-                         <div class="picker-item">
-                           <span>${esc(c.title)} <span class="badge muted">${c.kind === 'channel' ? '频道' : c.kind === 'supergroup' ? '超级群' : '群组'}</span> <span class="mono muted">${esc(c.id)}</span> ${c.noforwards ? '<span class="badge warning">禁转发</span>' : ''}</span>
-                           <span class="actions">
-                             <button type="button" class="btn small" data-pick-src="${esc(c.id)}">+ 源</button>
-                             <button type="button" class="btn small" data-pick-tgt="${esc(c.id)}">+ 目标</button>
-                           </span>
-                         </div>`
-                         )
-                         .join('')}
+                     <label>从「${esc(accountName(data.account_id || 'default'))}」已加入频道快速勾选（共 ${chatList.length} 个 · 已选 ${(data.sources || []).length} 源 / ${(data.targets || []).length} 目标）</label>
+                     <div class="picker-toolbar">
+                       <input id="rm-chat-filter" type="text" value="${esc(state.modalPickerQuery)}" placeholder="搜索频道名称、ID 或 @username..." />
+                     </div>
+                     <div class="picker-box" id="rm-picker-box">
+                       ${renderPickerItemsHtml(chatList, data, state.modalPickerQuery)}
                      </div>
                    </div>`
                 : '<div class="hint">该账号暂无已加入频道或尚未登录，也可直接手动输入频道 ID / @username</div>'
@@ -1473,6 +1508,7 @@
 
     const openRuleModal = async (idx, data) => {
       state.testOutput = null;
+      state.modalPickerQuery = '';
       const cloned = JSON.parse(JSON.stringify(data));
       if (!cloned.account_id) cloned.account_id = state.accounts[0]?.id || 'default';
       state.modalRule = { idx, data: cloned, chats: [] };
@@ -1565,22 +1601,52 @@
       document.querySelectorAll('[data-rm-del-tgt]').forEach((b) => {
         b.onclick = () => { syncRuleModalFromDom(); state.modalRule.data.targets.splice(Number(b.dataset.rmDelTgt), 1); render(); };
       });
-      document.querySelectorAll('[data-pick-src]').forEach((b) => {
-        b.onclick = () => {
-          syncRuleModalFromDom();
-          const v = Number(b.dataset.pickSrc);
-          if (!state.modalRule.data.sources.map(String).includes(String(v))) state.modalRule.data.sources.push(v);
-          render();
+      const bindPickerButtons = () => {
+        document.querySelectorAll('[data-pick-src]').forEach((b) => {
+          b.onclick = () => {
+            syncRuleModalFromDom();
+            const idStr = String(b.dataset.pickSrc);
+            const chat = (state.modalRule.chats || []).find((c) => String(c.id) === idStr);
+            const uname = chat && chat.username ? '@' + chat.username.toLowerCase() : '';
+            const cur = state.modalRule.data.sources || [];
+            const idx = cur.findIndex((x) => {
+              const s = String(x).trim();
+              return s === idStr || (uname && s.toLowerCase() === uname);
+            });
+            if (idx >= 0) cur.splice(idx, 1);
+            else cur.push(Number(idStr));
+            render();
+          };
+        });
+        document.querySelectorAll('[data-pick-tgt]').forEach((b) => {
+          b.onclick = () => {
+            syncRuleModalFromDom();
+            const idStr = String(b.dataset.pickTgt);
+            const chat = (state.modalRule.chats || []).find((c) => String(c.id) === idStr);
+            const uname = chat && chat.username ? '@' + chat.username.toLowerCase() : '';
+            const cur = state.modalRule.data.targets || [];
+            const idx = cur.findIndex((x) => {
+              const s = String(x).trim();
+              return s === idStr || (uname && s.toLowerCase() === uname);
+            });
+            if (idx >= 0) cur.splice(idx, 1);
+            else cur.push(Number(idStr));
+            render();
+          };
+        });
+      };
+      bindPickerButtons();
+      const chatFilterInput = document.getElementById('rm-chat-filter');
+      if (chatFilterInput) {
+        chatFilterInput.oninput = () => {
+          state.modalPickerQuery = chatFilterInput.value;
+          const box = document.getElementById('rm-picker-box');
+          if (box && state.modalRule) {
+            box.innerHTML = renderPickerItemsHtml(state.modalRule.chats || [], state.modalRule.data, state.modalPickerQuery);
+            bindPickerButtons();
+          }
         };
-      });
-      document.querySelectorAll('[data-pick-tgt]').forEach((b) => {
-        b.onclick = () => {
-          syncRuleModalFromDom();
-          const v = Number(b.dataset.pickTgt);
-          if (!state.modalRule.data.targets.map(String).includes(String(v))) state.modalRule.data.targets.push(v);
-          render();
-        };
-      });
+      }
 
       document.getElementById('btn-test-regex').onclick = async () => {
         syncRuleModalFromDom();
@@ -1973,8 +2039,16 @@
   }
 
   function render() {
+    const modalEl = document.querySelector('#rule-modal-overlay .modal');
+    const pickerEl = document.getElementById('rm-picker-box');
+    const modalScroll = modalEl ? modalEl.scrollTop : 0;
+    const pickerScroll = pickerEl ? pickerEl.scrollTop : 0;
     document.getElementById('app').innerHTML = state.authed ? renderApp() : renderLogin();
     bindEvents();
+    const newModalEl = document.querySelector('#rule-modal-overlay .modal');
+    const newPickerEl = document.getElementById('rm-picker-box');
+    if (newModalEl && modalScroll) newModalEl.scrollTop = modalScroll;
+    if (newPickerEl && pickerScroll) newPickerEl.scrollTop = pickerScroll;
   }
 
   async function boot() {
