@@ -153,22 +153,27 @@ class WebConsole:
         me_info = None
         if runner and acct_dict.get("enabled", True):
             try:
-                if not runner.client.is_connected():
-                    await runner.client.connect()
-                authorized = await runner.client.is_user_authorized()
-                listening = runner.listening
+                authorized = await runner.ensure_authorized(verify_live=True)
                 if authorized:
                     me = await runner.client.get_me()
-                    phone = getattr(me, "phone", None) or ""
-                    masked = (phone[:3] + "****" + phone[-4:]) if len(phone) >= 7 else ("已绑定" if phone else "")
-                    me_info = {
-                        "id": me.id,
-                        "name": " ".join(p for p in [me.first_name, me.last_name] if p) or str(me.id),
-                        "username": me.username or "",
-                        "phone": masked,
-                    }
+                    if me is None:
+                        runner.mark_unauthorized()
+                        authorized = False
+                        listening = False
+                    else:
+                        listening = bool(runner.listening)
+                        phone = getattr(me, "phone", None) or ""
+                        masked = (phone[:3] + "****" + phone[-4:]) if len(phone) >= 7 else ("已绑定" if phone else "")
+                        me_info = {
+                            "id": me.id,
+                            "name": " ".join(p for p in [me.first_name, me.last_name] if p) or str(me.id),
+                            "username": me.username or "",
+                            "phone": masked,
+                        }
             except Exception as exc:
                 log.warning("Failed to inspect account %s: %s", acct_id, exc)
+                authorized = False
+                listening = False
         rules_count = sum(1 for r in rules if (r.get("account_id") or "default") == acct_id)
         qr_st = self._qr_states.get(acct_id) or {"status": "idle", "error": ""}
         return {
@@ -660,9 +665,7 @@ class WebConsole:
             body = {}
         acct_id = str(body.get("account_id") or request.query.get("account_id") or "default").strip() or "default"
         runner = self._resolve_runner_or_404(acct_id)
-        if not runner.client.is_connected():
-            await runner.client.connect()
-        if await runner.client.is_user_authorized():
+        if await runner.ensure_authorized(verify_live=True):
             return web.json_response({"status": "authorized"})
         old_task = self._qr_tasks.get(acct_id)
         if old_task and not old_task.done():
@@ -776,9 +779,7 @@ class WebConsole:
         runner = self.manager.get_runner(acct_id)
         if not runner or not runner.enabled:
             return web.json_response({"authorized": False, "account_id": acct_id, "items": []})
-        if not runner.client.is_connected():
-            await runner.client.connect()
-        if not await runner.client.is_user_authorized():
+        if not await runner.ensure_authorized(verify_live=True):
             return web.json_response({"authorized": False, "account_id": acct_id, "items": []})
 
         refresh = request.query.get("refresh", "0") == "1"

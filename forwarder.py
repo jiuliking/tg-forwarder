@@ -17,6 +17,7 @@ from telethon.errors import (
     FloodWaitError,
     MsgIdInvalidError,
     RPCError,
+    UnauthorizedError,
 )
 from telethon.tl.types import DocumentAttributeVideo, MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage
 
@@ -83,10 +84,53 @@ class AccountRunner:
     async def start(self) -> None:
         if not self.client.is_connected():
             await self.client.connect()
-        if await self.client.is_user_authorized():
+        if await self.ensure_authorized(verify_live=True):
             await self.on_user_authorized()
         else:
             log.warning("[%s] Session not yet authorized; complete login via Web UI", self.account_name)
+
+    def mark_unauthorized(self) -> None:
+        self.listening = False
+        self.source_map = {}
+        self.target_cache = {}
+        self.chats_cache = []
+        try:
+            self.client._authorized = False
+        except Exception:
+            pass
+
+    async def ensure_authorized(self, verify_live: bool = False) -> bool:
+        if not self.client.is_connected():
+            await self.client.connect()
+        if verify_live:
+            try:
+                self.client._authorized = None
+            except Exception:
+                pass
+        ok = await self.client.is_user_authorized()
+        if not ok:
+            self.mark_unauthorized()
+            return False
+        if verify_live:
+            me = await self.client.get_me()
+            if me is None:
+                self.mark_unauthorized()
+                return False
+        return True
+
+    async def _run_listener(self) -> None:
+        try:
+            await self.client.run_until_disconnected()
+        except asyncio.CancelledError:
+            raise
+        except UnauthorizedError as exc:
+            log.error("[%s] Telegram session revoked/unauthorized (%s); please re-login via Web UI", self.account_name, exc)
+            self.mark_unauthorized()
+        except Exception as exc:
+            log.warning("[%s] Listener stopped: %s", self.account_name, exc)
+            self.listening = False
+        else:
+            self.listening = False
 
     async def stop(self) -> None:
         self.listening = False
@@ -101,6 +145,10 @@ class AccountRunner:
 
     async def on_user_authorized(self) -> None:
         me = await self.client.get_me()
+        if me is None:
+            self.mark_unauthorized()
+            log.warning("[%s] Session not authorized (get_me returned None)", self.account_name)
+            return
         log.info("[%s] Logged in as %s (id=%s)", self.account_name, me.username or me.first_name, me.id)
         if not self._handlers_attached:
             @self.client.on(events.Album())
@@ -116,7 +164,7 @@ class AccountRunner:
         await self.refresh_routes(self.manager.cfg)
         self.listening = True
         if self._listen_task is None or self._listen_task.done():
-            self._listen_task = asyncio.create_task(self.client.run_until_disconnected())
+            self._listen_task = asyncio.create_task(self._run_listener())
         log.info("[%s] Listening for updates...", self.account_name)
 
     @staticmethod
@@ -208,15 +256,24 @@ class AccountRunner:
 
     @staticmethod
     def _is_channel_sender(msg: Any, source_id: int) -> bool:
-        if getattr(msg, "sender_id", None) == source_id:
+        if getattr(msg, "action", None) is not None:
+            return False
+        sender_id = getattr(msg, "sender_id", None)
+        if sender_id == source_id:
             return True
         from_id = getattr(msg, "from_id", None)
         if from_id is not None:
             try:
-                return utils.get_peer_id(from_id) == source_id
+                pid = utils.get_peer_id(from_id)
+                if pid == source_id:
+                    return True
+                peer_id = getattr(msg, "peer_id", None)
+                if peer_id is not None and pid == utils.get_peer_id(peer_id):
+                    return True
+                return False
             except Exception:
                 return False
-        return False
+        return sender_id is None
 
     @staticmethod
     def _file_size_mb(msg: Any) -> float:
@@ -569,6 +626,8 @@ class AccountRunner:
                         any_reuploaded = False
                         aborted = False
                         for c_idx, chunk in enumerate(chunks):
+                            if c_idx > 0:
+                                await asyncio.sleep(min(2.0, max(0.8, self.manager.cfg.delay_seconds or 1.0)))
                             cap = cleaned_text if c_idx == 0 else ""
                             ents = cleaned_entities if c_idx == 0 else None
                             restricted = self._is_noforwards(chat, chunk)
@@ -1003,10 +1062,8 @@ class AccountRunner:
         msg_id = int(item["msg_id"])
         if target_id == 0:
             return False, "该记录没有目标频道，无法重发"
-        if not self.client.is_connected():
-            await self.client.connect()
-        if not await self.client.is_user_authorized():
-            return False, "对应账号尚未登录 Telegram"
+        if not await self.ensure_authorized(verify_live=True):
+            return False, "对应账号尚未登录 Telegram（或会话已失效，请重新登录）"
 
         try:
             source_ent = await self.client.get_entity(source_id)
