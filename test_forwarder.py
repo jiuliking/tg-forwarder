@@ -521,6 +521,29 @@ class Audit(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(slow_task, 2)
         r.client.send_file.assert_awaited_once()
 
+    async def test_channel_without_comment_section_skips_comment_wait_and_forwards_immediately(self):
+        r = self.runner
+        settings = rule(collect_comments=True, comment_wait_seconds=60)
+        r.source_map = {SOURCE: [settings]}
+        r.manager.cfg.rules = [settings]
+
+        # Make client callable like TelegramClient to handle GetFullChannelRequest -> linked_chat_id=None
+        client = AsyncMock(return_value=NS(full_chat=NS(linked_chat_id=None)))
+        client.forward_messages = AsyncMock(return_value=post(77))
+        client.send_file = AsyncMock()
+        r.client = client
+
+        await r._process_single_message(CHAT, SOURCE, post(50, 'photo', MessageMediaPhoto()), [settings])
+        client.forward_messages.assert_awaited_once()
+        self.assertEqual(len(r._bg_tasks), 0, 'should not schedule comment wait for channel without linked_chat_id')
+
+        # If a later message explicitly arrives with replies.comments=True, auto-upgrade to comment mode
+        msg_with_comments = post(51, 'photo2', MessageMediaPhoto())
+        msg_with_comments.replies = NS(comments=True)
+        with patch.object(r, '_schedule_comment_forward') as sched:
+            await r._process_single_message(CHAT, SOURCE, msg_with_comments, [settings])
+            sched.assert_called_once()
+
     async def test_comment_mode_checks_every_main_album_caption(self):
         r = self.runner
         await self.merged([post(1, 'normal', MessageMediaPhoto()), post(2, 'advertisement', MessageMediaPhoto())],

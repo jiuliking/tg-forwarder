@@ -21,6 +21,7 @@ from telethon.errors import (
     RPCError,
     UnauthorizedError,
 )
+from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import (
     DocumentAttributeAnimated,
     DocumentAttributeAudio,
@@ -68,6 +69,7 @@ logging.basicConfig(
 log = logging.getLogger("tg-forwarder")
 
 ALBUM_FIRST_READ_SECONDS = 4
+CHANNEL_COMMENTS_TTL_SECONDS = 600
 RECOVERY_CHECKPOINT_SECONDS = 30
 RECOVERY_OVERLAP_SECONDS = 120
 RECOVERY_MAX_LOOKBACK_SECONDS = 30 * 60
@@ -130,6 +132,7 @@ class AccountRunner:
         self._listen_task: Optional[asyncio.Task[None]] = None
         self._recovery_started_at = int(time.time())
         self._source_activated_at: dict[int, int] = {}
+        self._channel_comments_cache: dict[int, tuple[bool, float]] = {}
         self._recovery_task: Optional[asyncio.Task[None]] = None
         self._checkpoint_task: Optional[asyncio.Task[None]] = None
         self._recovery_requested_at: int | None = None
@@ -307,11 +310,51 @@ class AccountRunner:
             self._bg_tasks.add(self._recovery_task)
             self._recovery_task.add_done_callback(self._bg_tasks.discard)
 
-    def _recovery_settle_seconds(self, rules: list[CompiledRule]) -> int:
-        comment_delay = max(
-            (rule.comment_wait_seconds + self.manager.cfg.comment_max_extra_seconds for rule in rules if rule.collect_comments),
-            default=0,
-        )
+    def _get_channel_comments_cache(self) -> dict[int, tuple[bool, float]]:
+        cache = getattr(self, "_channel_comments_cache", None)
+        if cache is None:
+            cache = self._channel_comments_cache = {}
+        return cache
+
+    async def _channel_has_comments(self, chat: Any, source_id: int, msgs: list[Any] | tuple[Any, ...] = ()) -> bool:
+        if not bool(getattr(chat, "broadcast", False)):
+            return False
+        cache = self._get_channel_comments_cache()
+        now = monotonic()
+        if any(bool(getattr(getattr(m, "replies", None), "comments", False)) for m in msgs):
+            cache[source_id] = (True, now)
+            return True
+        cached = cache.get(source_id)
+        if cached is not None and (now - cached[1]) < CHANNEL_COMMENTS_TTL_SECONDS:
+            return cached[0]
+        if not callable(self.client):
+            return True
+        try:
+            full = await self.client(GetFullChannelRequest(chat))
+            linked = getattr(getattr(full, "full_chat", None), "linked_chat_id", None)
+            has_comments = bool(linked)
+            cache[source_id] = (has_comments, now)
+            log.debug(
+                "[%s] Probed comments for channel %s: has_comments=%s (linked_chat_id=%s)",
+                self.account_name,
+                source_id,
+                has_comments,
+                linked,
+            )
+            return has_comments
+        except Exception as exc:
+            log.debug("[%s] Could not probe comment section for %s: %s", self.account_name, source_id, exc)
+            return True
+
+    def _recovery_settle_seconds(self, rules: list[CompiledRule], source_id: int | None = None) -> int:
+        cached = self._get_channel_comments_cache().get(source_id) if source_id is not None else None
+        if cached is not None and not cached[0]:
+            comment_delay = 0
+        else:
+            comment_delay = max(
+                (rule.comment_wait_seconds + self.manager.cfg.comment_max_extra_seconds for rule in rules if rule.collect_comments),
+                default=0,
+            )
         return self.manager.cfg.album_max_wait_seconds + comment_delay
 
     def _checkpoint_recovery(self, now: int) -> None:
@@ -323,7 +366,7 @@ class AccountRunner:
             if floor is None:
                 updates[source_id] = now
             elif not recovering and source_id not in self._recovery_failed_sources:
-                cutoff = now - self._recovery_settle_seconds(rules) - RECOVERY_OVERLAP_SECONDS
+                cutoff = now - self._recovery_settle_seconds(rules, source_id) - RECOVERY_OVERLAP_SECONDS
                 if cutoff > floor:
                     updates[source_id] = cutoff
         if updates:
@@ -340,7 +383,7 @@ class AccountRunner:
             until = self._recovery_requested_at
             self._recovery_requested_at = None
             floors = self.manager.dedup.recovery_floors(self.account_id)
-            sources = sorted(self.source_map, key=lambda source: self._recovery_settle_seconds(self.source_map[source]))
+            sources = sorted(self.source_map, key=lambda source: self._recovery_settle_seconds(self.source_map[source], source))
             activated = getattr(self, "_source_activated_at", {})
             new_floors = {
                 source_id: activated.get(source_id, self._recovery_started_at)
@@ -353,7 +396,7 @@ class AccountRunner:
                 since = max(floors[source_id], until - RECOVERY_MAX_LOOKBACK_SECONDS)
                 if since >= until or source_id not in self.source_map:
                     continue
-                settle = self._recovery_settle_seconds(self.source_map[source_id])
+                settle = self._recovery_settle_seconds(self.source_map[source_id], source_id)
                 await asyncio.sleep(max(0, until + settle - time.time()))
                 if not self.enabled or not self.listening or not self.client.is_connected():
                     return
@@ -423,6 +466,7 @@ class AccountRunner:
 
     async def refresh_routes(self, cfg: AppConfig) -> None:
         new_source_map: dict[int, list[CompiledRule]] = {}
+        new_source_entities: dict[int, Any] = {}
         new_target_cache: dict[int | str, Any] = {}
 
         if self.enabled and await self.ensure_authorized(verify_live=False):
@@ -434,6 +478,7 @@ class AccountRunner:
                         ent = await self.client.get_entity(src)
                         peer_id = utils.get_peer_id(ent)
                         self.chat_titles[peer_id] = self._entity_title(ent, src)
+                        new_source_entities[peer_id] = ent
                         lst = new_source_map.setdefault(peer_id, [])
                         if rule not in lst:
                             lst.append(rule)
@@ -460,11 +505,35 @@ class AccountRunner:
         for old_id in list(activated):
             if old_id not in new_source_map:
                 activated.pop(old_id, None)
-        log.info(
-            "[%s] Loaded %d active sources for account",
-            self.account_name,
-            len(self.source_map),
-        )
+
+        comments_cache = self._get_channel_comments_cache()
+        for old_id in list(comments_cache):
+            if old_id not in new_source_map:
+                comments_cache.pop(old_id, None)
+        comment_probed = 0
+        comment_enabled = 0
+        if callable(self.client):
+            for peer_id, rules_list in new_source_map.items():
+                ent = new_source_entities.get(peer_id)
+                if ent is not None and bool(getattr(ent, "broadcast", False)) and any(r.collect_comments for r in rules_list):
+                    comment_probed += 1
+                    if await self._channel_has_comments(ent, peer_id):
+                        comment_enabled += 1
+
+        if comment_probed:
+            log.info(
+                "[%s] Loaded %d active sources for account (comments enabled: %d/%d)",
+                self.account_name,
+                len(self.source_map),
+                comment_enabled,
+                comment_probed,
+            )
+        else:
+            log.info(
+                "[%s] Loaded %d active sources for account",
+                self.account_name,
+                len(self.source_map),
+            )
 
     def _rules_for_chat(self, chat_id: int) -> list[CompiledRule]:
         return self.source_map.get(chat_id, [])
@@ -1836,8 +1905,13 @@ class AccountRunner:
         has_real_media = self._is_real_media(msg)
 
         is_broadcast = bool(getattr(chat, "broadcast", False))
-        comment_rules = [r for r in rules if r.collect_comments and is_broadcast]
-        normal_rules = [r for r in rules if not (r.collect_comments and is_broadcast)]
+        has_comments = (
+            await self._channel_has_comments(chat, source_id, [msg])
+            if is_broadcast and any(r.collect_comments for r in rules)
+            else False
+        )
+        comment_rules = [r for r in rules if r.collect_comments and has_comments]
+        normal_rules = [r for r in rules if not (r.collect_comments and has_comments)]
         for rule in comment_rules:
             if recovering:
                 await self._process_with_comments(chat, source_id, source_title, [msg], rule,
@@ -1952,8 +2026,13 @@ class AccountRunner:
         raw_preview = next((m.message for m in msgs if m.message), "") or f"[相册 {len(msgs)} 项]"
 
         is_broadcast = bool(getattr(chat, "broadcast", False))
-        comment_rules = [r for r in rules if r.collect_comments and is_broadcast]
-        normal_rules = [r for r in rules if not (r.collect_comments and is_broadcast)]
+        has_comments = (
+            await self._channel_has_comments(chat, source_id, msgs)
+            if is_broadcast and any(r.collect_comments for r in rules)
+            else False
+        )
+        comment_rules = [r for r in rules if r.collect_comments and has_comments]
+        normal_rules = [r for r in rules if not (r.collect_comments and has_comments)]
         for rule in comment_rules:
             if recovering_rules is not None:
                 await self._process_with_comments(chat, source_id, source_title, msgs, rule,
