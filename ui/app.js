@@ -169,6 +169,19 @@
     return map[mode] || `<span class="badge muted">${esc(mode)}</span>`;
   }
 
+  function renderLogBadges(it) {
+    const parts = [modeBadge(it.mode, it.status)];
+    if (it.status === 'error' && it.resent_at) {
+      parts.push(`<span class="badge success compact" title="已于 ${esc(fmtTime(it.resent_at))} 重发成功">✓ 已重发</span>`);
+    } else if (it.status === 'success' && it.resent_at) {
+      parts.push(`<span class="badge muted compact" title="已于 ${esc(fmtTime(it.resent_at))} 再次重发">已重发</span>`);
+    }
+    if (it.resend_tag) {
+      parts.push(`<span class="badge violet compact">${esc(it.resend_tag)}</span>`);
+    }
+    return parts;
+  }
+
   function themeSwitchHtml() {
     const opts = [
       ['light', '亮'],
@@ -469,7 +482,7 @@
                     <span>${fmtTime(it.ts)}</span>
                   </div>
                 </div>
-                ${modeBadge(it.mode, it.status)}
+                <div class="recent-badges">${renderLogBadges(it).join('')}</div>
               </div>`
                   )
                   .join('')
@@ -674,22 +687,23 @@
                 ? items
                     .map(
                       (it) => `
-                  <tr>
+                  <tr class="${it.status === 'error' && it.resent_at ? 'log-row-resolved' : ''}">
                     <td class="mono" style="white-space:nowrap">${fmtTime(it.ts)}</td>
                     <td>
                       <div style="font-weight:500">${esc(it.rule_name)}</div>
                       <div class="hint">${esc(it.account_name || it.account_id || '默认账号')}</div>
                     </td>
-                    <td>${modeBadge(it.mode, it.status)}</td>
+                    <td><div class="log-badges">${renderLogBadges(it).join('')}</div></td>
                     <td>${esc(it.source_title)} → ${esc(it.target_title)}</td>
                     <td>
                       <div>${esc(it.preview || '[媒体消息]')}</div>
                       ${it.detail ? `<div class="hint" style="color:${it.status === 'error' ? 'var(--danger)' : 'var(--text-3)'}">${renderLogDetail(it)}</div>` : ''}
+                      ${it.status === 'error' && it.resent_at ? `<div class="hint" style="color:var(--success)">已于 ${esc(fmtTime(it.resent_at))} 重发成功</div>` : ''}
                     </td>
                     <td style="white-space:nowrap">
                       ${
                         it.target_id && Number(it.target_id) !== 0
-                          ? `<button type="button" class="btn small" data-resend-log="${it.id}" ${state.resendingIds[it.id] ? 'disabled' : ''}>${state.resendingIds[it.id] ? '重发中...' : '重发'}</button>`
+                          ? `<button type="button" class="btn small ${it.resent_at ? 'subtle' : ''}" data-resend-log="${it.id}" ${it.resent_at ? `data-resent-at="${esc(fmtTime(it.resent_at))}" title="已于 ${esc(fmtTime(it.resent_at))} 重发成功，点击可再次发送"` : ''} ${state.resendingIds[it.id] ? 'disabled' : ''}>${state.resendingIds[it.id] ? '重发中...' : (it.resent_at ? '再次重发' : '重发')}</button>`
                           : '<span class="muted">-</span>'
                       }
                     </td>
@@ -2361,6 +2375,9 @@
       b.onclick = async () => {
         const id = b.dataset.resendLog;
         if (state.resendingIds[id]) return;
+        if (b.dataset.resentAt && !confirm(`该消息已于 ${b.dataset.resentAt} 成功重发过，确定还要再次发送吗？`)) {
+          return;
+        }
         state.resendingIds[id] = true;
         b.disabled = true;
         b.textContent = '重发中...';

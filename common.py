@@ -1017,6 +1017,58 @@ class HistoryStore:
             "db_size_bytes": db_size,
         }
 
+    def _annotate_resend_status(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not items:
+            return items
+        keys: set[tuple[str, int, int, int]] = set()
+        for it in items:
+            tid = int(it.get("target_id") or 0)
+            mid = int(it.get("msg_id") or 0)
+            if tid != 0 and mid != 0:
+                keys.add((str(it.get("account_id") or "default"), int(it.get("source_id") or 0), tid, mid))
+
+        success_by_key: dict[tuple[str, int, int, int], list[tuple[int, int]]] = {}
+        if keys:
+            source_ids = sorted({k[1] for k in keys})
+            msg_ids = sorted({k[3] for k in keys})
+            s_ph = ",".join("?" for _ in source_ids)
+            m_ph = ",".join("?" for _ in msg_ids)
+            rows = self.conn.execute(
+                f"""
+                SELECT id, ts, account_id, source_id, target_id, msg_id
+                FROM history
+                WHERE status = 'success'
+                  AND source_id IN ({s_ph})
+                  AND msg_id IN ({m_ph})
+                ORDER BY id ASC
+                """,
+                [*source_ids, *msg_ids],
+            ).fetchall()
+            for r in rows:
+                k = (str(r["account_id"] or "default"), int(r["source_id"]), int(r["target_id"]), int(r["msg_id"]))
+                if k in keys:
+                    success_by_key.setdefault(k, []).append((int(r["id"]), int(r["ts"])))
+
+        for it in items:
+            row_id = int(it.get("id") or 0)
+            tid = int(it.get("target_id") or 0)
+            mid = int(it.get("msg_id") or 0)
+            k = (str(it.get("account_id") or "default"), int(it.get("source_id") or 0), tid, mid)
+            later = [ts for sid, ts in success_by_key.get(k, ()) if sid > row_id] if tid != 0 and mid != 0 else []
+            it["resent_at"] = later[-1] if later else None
+            it["resent_count"] = len(later)
+            detail = str(it.get("detail") or "")
+            if it.get("status") == "success":
+                if "手动重发" in detail:
+                    it["resend_tag"] = "手动重发"
+                elif "补发" in detail:
+                    it["resend_tag"] = "补发"
+                else:
+                    it["resend_tag"] = ""
+            else:
+                it["resend_tag"] = ""
+        return items
+
     def recent(
         self,
         limit: int = 50,
@@ -1043,7 +1095,7 @@ class HistoryStore:
             f"SELECT * FROM history {where} ORDER BY id DESC LIMIT ? OFFSET ?",
             [*params, lim, off],
         ).fetchall()
-        return [dict(r) for r in rows]
+        return self._annotate_resend_status([dict(r) for r in rows])
 
     def query_page(
         self,
@@ -1075,7 +1127,7 @@ class HistoryStore:
             [*params, size, offset],
         ).fetchall()
         return {
-            "items": [dict(r) for r in rows],
+            "items": self._annotate_resend_status([dict(r) for r in rows]),
             "total": total,
             "page": cur_page,
             "page_size": size,

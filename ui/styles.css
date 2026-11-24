@@ -366,6 +366,12 @@ html[data-theme='dark'] .btn.primary:hover:not(:disabled) { background: #ffffff;
 .badge.info { color: var(--info); background: var(--info-soft); }
 .badge.violet { color: var(--violet); background: var(--violet-soft); }
 .badge.muted { color: var(--text-3); background: var(--surface-muted); }
+.badge.compact { height: 19px; padding: 0 6px; font-size: 11px; }
+.log-badges { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.recent-badges { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+tr.log-row-resolved { background: var(--surface-muted); }
+.btn.subtle { color: var(--text-3); background: transparent; border-color: var(--line-strong); }
+.btn.subtle:hover { color: var(--text); background: var(--surface); }
 .badge.other-src { color: var(--warning); background: var(--warning-soft); border: 1px solid rgba(125, 92, 34, 0.25); }
 .badge.other-tgt { color: var(--violet); background: var(--violet-soft); border: 1px solid rgba(106, 76, 147, 0.25); }
 html[data-theme='dark'] .badge.other-src { border-color: rgba(216, 189, 128, 0.3); }

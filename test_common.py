@@ -349,6 +349,64 @@ def test_history_pagination() -> None:
         assert filtered["total"] == len([i for i in range(1, 66) if i % 2 and i % 3 == 0])
 
 
+def test_history_resend_status_annotation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        h = HistoryStore(Path(td) / "state.db")
+        h.record(
+            account_id="default",
+            account_name="A",
+            rule_name="舞蹈",
+            source_id=-1001,
+            source_title="src",
+            target_id=-1002,
+            target_title="tgt",
+            msg_id=2417,
+            item_count=1,
+            mode="reupload",
+            status="error",
+            preview="vid",
+            detail="Cannot send requests while disconnected",
+        )
+        h.record(
+            account_id="default",
+            account_name="A",
+            rule_name="舞蹈",
+            source_id=-1001,
+            source_title="src",
+            target_id=-1002,
+            target_title="tgt",
+            msg_id=2418,
+            item_count=1,
+            mode="reupload",
+            status="error",
+            preview="vid2",
+            detail="still failed",
+        )
+        h.record(
+            account_id="default",
+            account_name="A",
+            rule_name="舞蹈",
+            source_id=-1001,
+            source_title="src",
+            target_id=-1002,
+            target_title="tgt",
+            msg_id=2417,
+            item_count=1,
+            mode="reupload",
+            status="success",
+            preview="vid",
+            detail="手动重发",
+        )
+        page = h.query_page(page=1, page_size=10)["items"]
+        by_key = {(x["msg_id"], x["status"]): x for x in page}
+        assert by_key[(2417, "error")]["resent_at"] is not None
+        assert by_key[(2417, "error")]["resent_count"] == 1
+        assert by_key[(2417, "success")]["resent_at"] is None
+        assert by_key[(2417, "success")]["resend_tag"] == "手动重发"
+        assert by_key[(2418, "error")]["resent_at"] is None
+        assert by_key[(2418, "error")]["resent_count"] == 0
+
+
 def test_find_matched_regex_branches() -> None:
     pat = "(?i)担保|国际|信誉|广告|赛事|导航|引擎|商务|互推|付费|TRX|能量|自助|必备"
     assert find_matched_regex_branches("已收录名单导航，自助会员群", pat) == ["导航", "自助"]
@@ -446,5 +504,6 @@ if __name__ == "__main__":
     test_find_matched_regex_branches()
     test_stores_and_config_roundtrip()
     test_history_pagination()
+    test_history_resend_status_annotation()
     test_regex_library_and_web_crud()
     print("ALL TESTS PASSED")
