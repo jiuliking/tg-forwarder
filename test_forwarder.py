@@ -524,25 +524,28 @@ class Audit(unittest.IsolatedAsyncioTestCase):
     async def test_channel_without_comment_section_skips_comment_wait_and_forwards_immediately(self):
         r = self.runner
         settings = rule(collect_comments=True, comment_wait_seconds=60)
-        r.source_map = {SOURCE: [settings]}
-        r.manager.cfg.rules = [settings]
-
+        src_channel = NS(id=11, broadcast=True, noforwards=False, title='NoComments')
         # Make client callable like TelegramClient to handle GetFullChannelRequest -> linked_chat_id=None
         client = AsyncMock(return_value=NS(full_chat=NS(linked_chat_id=None)))
+        client.get_entity = AsyncMock(side_effect=[InputPeerChannel(11, 1), TARGET_PEER])
+        client.get_input_entity = AsyncMock(return_value=TARGET_PEER)
         client.forward_messages = AsyncMock(return_value=post(77))
         client.send_file = AsyncMock()
         r.client = client
+        r.ensure_authorized = AsyncMock(return_value=True)
 
-        await r._process_single_message(CHAT, SOURCE, post(50, 'photo', MessageMediaPhoto()), [settings])
+        # Simulate refresh_routes probing a broadcast source with linked_chat_id=None
+        with patch.object(r.client, 'get_entity', AsyncMock(side_effect=[NS(channel_id=11, access_hash=1, broadcast=True), TARGET_PEER])), \
+             patch('forwarder.utils.get_peer_id', side_effect=[SOURCE, TARGET]):
+            await r.refresh_routes(NS(rules=[settings]))
+        self.assertIs(r._channel_comments_map.get(SOURCE), False)
+        client.assert_awaited_once()  # probed once during refresh_routes only
+
+        # Forwarding a message should NOT call GetFullChannelRequest again and should forward immediately
+        await r._process_single_message(src_channel, SOURCE, post(50, 'photo', MessageMediaPhoto()), [settings])
+        client.assert_awaited_once()
         client.forward_messages.assert_awaited_once()
         self.assertEqual(len(r._bg_tasks), 0, 'should not schedule comment wait for channel without linked_chat_id')
-
-        # If a later message explicitly arrives with replies.comments=True, auto-upgrade to comment mode
-        msg_with_comments = post(51, 'photo2', MessageMediaPhoto())
-        msg_with_comments.replies = NS(comments=True)
-        with patch.object(r, '_schedule_comment_forward') as sched:
-            await r._process_single_message(CHAT, SOURCE, msg_with_comments, [settings])
-            sched.assert_called_once()
 
     async def test_comment_mode_checks_every_main_album_caption(self):
         r = self.runner

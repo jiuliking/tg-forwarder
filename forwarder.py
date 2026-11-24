@@ -69,7 +69,6 @@ logging.basicConfig(
 log = logging.getLogger("tg-forwarder")
 
 ALBUM_FIRST_READ_SECONDS = 4
-CHANNEL_COMMENTS_TTL_SECONDS = 600
 RECOVERY_CHECKPOINT_SECONDS = 30
 RECOVERY_OVERLAP_SECONDS = 120
 RECOVERY_MAX_LOOKBACK_SECONDS = 30 * 60
@@ -132,7 +131,7 @@ class AccountRunner:
         self._listen_task: Optional[asyncio.Task[None]] = None
         self._recovery_started_at = int(time.time())
         self._source_activated_at: dict[int, int] = {}
-        self._channel_comments_cache: dict[int, tuple[bool, float]] = {}
+        self._channel_comments_map: dict[int, bool] = {}
         self._recovery_task: Optional[asyncio.Task[None]] = None
         self._checkpoint_task: Optional[asyncio.Task[None]] = None
         self._recovery_requested_at: int | None = None
@@ -310,30 +309,26 @@ class AccountRunner:
             self._bg_tasks.add(self._recovery_task)
             self._recovery_task.add_done_callback(self._bg_tasks.discard)
 
-    def _get_channel_comments_cache(self) -> dict[int, tuple[bool, float]]:
-        cache = getattr(self, "_channel_comments_cache", None)
-        if cache is None:
-            cache = self._channel_comments_cache = {}
-        return cache
+    def _get_channel_comments_map(self) -> dict[int, bool]:
+        cmap = getattr(self, "_channel_comments_map", None)
+        if cmap is None:
+            cmap = self._channel_comments_map = {}
+        return cmap
 
-    async def _channel_has_comments(self, chat: Any, source_id: int, msgs: list[Any] | tuple[Any, ...] = ()) -> bool:
+    def _source_has_comments(self, chat: Any, source_id: int) -> bool:
         if not bool(getattr(chat, "broadcast", False)):
             return False
-        cache = self._get_channel_comments_cache()
-        now = monotonic()
-        if any(bool(getattr(getattr(m, "replies", None), "comments", False)) for m in msgs):
-            cache[source_id] = (True, now)
-            return True
-        cached = cache.get(source_id)
-        if cached is not None and (now - cached[1]) < CHANNEL_COMMENTS_TTL_SECONDS:
-            return cached[0]
+        return self._get_channel_comments_map().get(source_id, True)
+
+    async def _probe_channel_comments(self, chat: Any, source_id: int) -> bool:
+        if not bool(getattr(chat, "broadcast", False)):
+            return False
         if not callable(self.client):
             return True
         try:
             full = await self.client(GetFullChannelRequest(chat))
             linked = getattr(getattr(full, "full_chat", None), "linked_chat_id", None)
             has_comments = bool(linked)
-            cache[source_id] = (has_comments, now)
             log.debug(
                 "[%s] Probed comments for channel %s: has_comments=%s (linked_chat_id=%s)",
                 self.account_name,
@@ -347,8 +342,8 @@ class AccountRunner:
             return True
 
     def _recovery_settle_seconds(self, rules: list[CompiledRule], source_id: int | None = None) -> int:
-        cached = self._get_channel_comments_cache().get(source_id) if source_id is not None else None
-        if cached is not None and not cached[0]:
+        has_comments = self._get_channel_comments_map().get(source_id, True) if source_id is not None else True
+        if not has_comments:
             comment_delay = 0
         else:
             comment_delay = max(
@@ -506,10 +501,10 @@ class AccountRunner:
             if old_id not in new_source_map:
                 activated.pop(old_id, None)
 
-        comments_cache = self._get_channel_comments_cache()
-        for old_id in list(comments_cache):
+        comments_map = self._get_channel_comments_map()
+        for old_id in list(comments_map):
             if old_id not in new_source_map:
-                comments_cache.pop(old_id, None)
+                comments_map.pop(old_id, None)
         comment_probed = 0
         comment_enabled = 0
         if callable(self.client):
@@ -517,7 +512,9 @@ class AccountRunner:
                 ent = new_source_entities.get(peer_id)
                 if ent is not None and bool(getattr(ent, "broadcast", False)) and any(r.collect_comments for r in rules_list):
                     comment_probed += 1
-                    if await self._channel_has_comments(ent, peer_id):
+                    has_comments = await self._probe_channel_comments(ent, peer_id)
+                    comments_map[peer_id] = has_comments
+                    if has_comments:
                         comment_enabled += 1
 
         if comment_probed:
@@ -1904,12 +1901,7 @@ class AccountRunner:
         orig_entities = list(msg.entities) if msg.entities else None
         has_real_media = self._is_real_media(msg)
 
-        is_broadcast = bool(getattr(chat, "broadcast", False))
-        has_comments = (
-            await self._channel_has_comments(chat, source_id, [msg])
-            if is_broadcast and any(r.collect_comments for r in rules)
-            else False
-        )
+        has_comments = self._source_has_comments(chat, source_id)
         comment_rules = [r for r in rules if r.collect_comments and has_comments]
         normal_rules = [r for r in rules if not (r.collect_comments and has_comments)]
         for rule in comment_rules:
@@ -2025,12 +2017,7 @@ class AccountRunner:
         lead_id = msgs[0].id
         raw_preview = next((m.message for m in msgs if m.message), "") or f"[相册 {len(msgs)} 项]"
 
-        is_broadcast = bool(getattr(chat, "broadcast", False))
-        has_comments = (
-            await self._channel_has_comments(chat, source_id, msgs)
-            if is_broadcast and any(r.collect_comments for r in rules)
-            else False
-        )
+        has_comments = self._source_has_comments(chat, source_id)
         comment_rules = [r for r in rules if r.collect_comments and has_comments]
         normal_rules = [r for r in rules if not (r.collect_comments and has_comments)]
         for rule in comment_rules:
