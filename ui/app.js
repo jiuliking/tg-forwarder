@@ -576,23 +576,22 @@
               ({ r, idx }) => `
             <article class="rule-card">
               <div class="rule-card-head">
-                <div>
-                  <div class="rule-card-title">${esc(r.name)}</div>
-                  <div class="row" style="margin-top:6px;gap:6px">
-                    <span class="badge ${r.enabled ? 'success status' : 'muted'}">${r.enabled ? '已启用' : '已停用'}</span>
-                    <span class="badge info">账号: ${esc(accountName(r.account_id || 'default'))}</span>
-                    ${r.drop_author !== false ? '<span class="badge info">无来源</span>' : ''}
-                    ${r.fallback_reupload !== false ? '<span class="badge warning">受限重传</span>' : ''}
-                    ${r.skip_text_only ? '<span class="badge info">跳过纯文字</span>' : ''}
-                    ${r.collect_comments ? `<span class="badge info">抓评论区(${(r.comment_merge_mode || state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批' : '凑满'})</span>` : ''}
-                    ${r.strip_all_text ? '<span class="badge warning">仅媒体</span>' : ''}
-                  </div>
-                </div>
-                <div class="actions">
+                <div class="rule-card-title" title="${esc(r.name)}">${esc(r.name)}</div>
+                <div class="actions rule-card-actions">
                   <button class="btn small" data-toggle-rule="${idx}">${r.enabled ? '停用' : '启用'}</button>
                   <button class="btn small" data-edit-rule="${idx}">编辑</button>
                   <button class="btn small danger" data-del-rule="${idx}">删除</button>
                 </div>
+              </div>
+
+              <div class="rule-card-badges">
+                <span class="badge ${r.enabled ? 'success status' : 'muted'}">${r.enabled ? '已启用' : '已停用'}</span>
+                <span class="badge info">账号: ${esc(accountName(r.account_id || 'default'))}</span>
+                ${r.drop_author !== false ? '<span class="badge info">无来源</span>' : ''}
+                ${r.fallback_reupload !== false ? '<span class="badge warning">受限重传</span>' : ''}
+                ${r.skip_text_only ? '<span class="badge info">跳过纯文字</span>' : ''}
+                ${r.collect_comments ? `<span class="badge info">抓评论区(${(r.comment_merge_mode || state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批' : '凑满'})</span>` : ''}
+                ${r.strip_all_text ? '<span class="badge warning">仅媒体</span>' : ''}
               </div>
 
               <div class="rule-peers">
@@ -600,7 +599,7 @@
                 <div><span class="muted">目标频道：</span>${(r.targets || []).map(peerLabel).join('、') || '<span class="muted">未设置</span>'}</div>
               </div>
 
-              <div class="hint">
+              <div class="hint rule-card-foot">
                 跳过正则 ${(r.skip_patterns || []).length} 条 · 清文正则 ${(r.strip_text_patterns || []).length} 条 · 去除正则 ${(r.strip_patterns || []).length} 条 · 替换 ${(r.replace_patterns || []).length} 条
               </div>
             </article>`
@@ -697,20 +696,8 @@
             (a) => `
           <article class="rule-card">
             <div class="rule-card-head">
-              <div>
-                <div class="rule-card-title">${esc(a.name)}</div>
-                <div class="row" style="margin-top:6px;gap:6px">
-                  ${
-                    !a.enabled
-                      ? '<span class="badge muted">已停用</span>'
-                      : a.authorized
-                      ? `<span class="badge success status">${a.listening ? '监听中' : '已连接'}</span>`
-                      : '<span class="badge warning status">等待登录</span>'
-                  }
-                  <span class="badge muted">绑定规则 ${a.rules_count} 条</span>
-                </div>
-              </div>
-              <div class="actions">
+              <div class="rule-card-title" title="${esc(a.name)}">${esc(a.name)}</div>
+              <div class="actions rule-card-actions">
                 ${
                   a.enabled && !a.authorized
                     ? `<button class="btn small primary" data-acct-login="${esc(a.id)}">登录 / 扫码</button>`
@@ -719,6 +706,17 @@
                 <button class="btn small" data-acct-rename="${esc(a.id)}">重命名</button>
                 <button class="btn small" data-acct-toggle="${esc(a.id)}" data-acct-enabled="${a.enabled ? '1' : '0'}">${a.enabled ? '停用' : '启用'}</button>
               </div>
+            </div>
+
+            <div class="rule-card-badges">
+              ${
+                !a.enabled
+                  ? '<span class="badge muted">已停用</span>'
+                  : a.authorized
+                  ? `<span class="badge success status">${a.listening ? '监听中' : '已连接'}</span>`
+                  : '<span class="badge warning status">等待登录</span>'
+              }
+              <span class="badge muted">绑定规则 ${a.rules_count} 条</span>
             </div>
 
             ${

@@ -410,11 +410,14 @@ tbody tr:hover { background: rgba(127, 137, 151, 0.05); }
 /* Rule Cards */
 .rule-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
 .rule-card {
-  display: flex; flex-direction: column; gap: 14px; padding: 20px;
+  display: flex; flex-direction: column; gap: 12px; padding: 20px;
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg);
 }
-.rule-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.rule-card-title { font-size: 16px; font-weight: 500; }
+.rule-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.rule-card-title { font-size: 16px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rule-card-actions { flex-shrink: 0; flex-wrap: nowrap; gap: 6px; }
+.rule-card-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.rule-card-foot { margin-top: auto; }
 .rule-peers { display: flex; flex-direction: column; gap: 8px; padding: 12px; background: var(--surface-muted); border-radius: 10px; font-size: 13px; }
 .peer-chip-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 .peer-chip {
