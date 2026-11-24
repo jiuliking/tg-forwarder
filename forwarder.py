@@ -92,6 +92,7 @@ class AccountRunner:
         self._send_lock = asyncio.Lock()
         self._auth_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._pending_albums: dict[tuple[int, int], set[int]] = {}
         self._handlers_attached = False
         self.listening = False
         self._listen_task: Optional[asyncio.Task[None]] = None
@@ -175,6 +176,7 @@ class AccountRunner:
                 t.cancel()
                 pending.append(t)
         self._bg_tasks.clear()
+        self._pending_albums.clear()
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
             pending.append(self._listen_task)
@@ -192,6 +194,7 @@ class AccountRunner:
                 t.cancel()
                 pending.append(t)
         self._bg_tasks.clear()
+        self._pending_albums.clear()
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
             pending.append(self._listen_task)
@@ -237,10 +240,6 @@ class AccountRunner:
                 return
             log.info("[%s] Logged in as %s (id=%s)", self.account_name, me.username or me.first_name, me.id)
             if not self._handlers_attached:
-                @self.client.on(events.Album())
-                async def _album_handler(event: events.Album.Event) -> None:
-                    await self.process_album(event)
-
                 @self.client.on(events.NewMessage())
                 async def _msg_handler(event: events.NewMessage.Event) -> None:
                     await self.process_single(event)
@@ -553,6 +552,56 @@ class AccountRunner:
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
+    async def _find_album_messages(self, chat: Any, group_id: int, anchors: set[int]) -> list[Any]:
+        # Albums contain up to ten messages. Match neighbors by grouped_id.
+        ids = sorted({mid for anchor in anchors for mid in range(max(1, anchor - 9), anchor + 10)})
+        messages = await self.client.get_messages(chat, ids=ids)
+        matches = [msg for msg in (messages or []) if getattr(msg, "grouped_id", None) == group_id]
+        return sorted(matches, key=lambda msg: msg.id)
+
+    def _queue_album(self, event: events.NewMessage.Event) -> None:
+        key = (event.chat_id, event.message.grouped_id)
+        if key in self._pending_albums:
+            self._pending_albums[key].add(event.message.id)
+            return
+        anchors = {event.message.id}
+        self._pending_albums[key] = anchors
+        task = asyncio.create_task(self._assemble_album(event, key, anchors))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _assemble_album(self, event: events.NewMessage.Event, key: tuple[int, int], anchors: set[int]) -> None:
+        source_id, group_id = key
+        previous: set[int] = set()
+        messages: list[Any] = []
+        try:
+            await asyncio.sleep(4)
+            if not self.enabled or not self._rules_for_chat(source_id):
+                return
+            chat = await event.get_chat()
+            if chat is None:
+                chat = await self.client.get_entity(source_id)
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(2)
+                messages = await self._find_album_messages(chat, group_id, anchors)
+                current = {msg.id for msg in messages}
+                if current and anchors <= current and (current == previous or len(current) == 10):
+                    break
+                previous = current
+        except (RPCError, OSError, TimeoutError, ValueError):
+            log.warning("[%s] Could not assemble album %s/%s", self.account_name, source_id, group_id, exc_info=True)
+            return
+        finally:
+            if self._pending_albums.get(key) is anchors:
+                self._pending_albums.pop(key, None)
+        if not messages:
+            log.warning("[%s] No source messages found for album %s/%s", self.account_name, source_id, group_id)
+        elif self.enabled:
+            log.info("[%s] Assembled album %s/%s: %d items from %d live updates", self.account_name,
+                     source_id, group_id, len(messages), len(anchors))
+            await self._process_album_messages(chat, source_id, messages)
+
     async def _fetch_channel_comment_batches(
         self,
         source_ent: Any,
@@ -634,7 +683,8 @@ class AccountRunner:
                 if peer is None:
                     continue
                 target_id = utils.get_peer_id(peer)
-                if not self.manager.dedup.seen(source_id, lead_id, target_id, account_id=self.account_id):
+                if not all(self.manager.dedup.seen(source_id, msg.id, target_id, account_id=self.account_id)
+                           for msg in main_msgs):
                     out[target_id] = (peer, target_id, self.chat_titles.get(target_id, str(target)))
             return list(out.values())
 
@@ -1269,11 +1319,9 @@ class AccountRunner:
             main_msgs: list[Any] = [lead_msg] if lead_msg is not None else []
             gid = getattr(lead_msg, "grouped_id", None) or (int(item["album_group_id"]) if item.get("album_group_id") else None)
             if gid is not None:
-                cand_ids = list(range(max(1, msg_id - 9), msg_id + 10))
-                cands = await self.client.get_messages(source_ent, ids=cand_ids)
-                grouped = [m for m in (cands or []) if m is not None and getattr(m, "grouped_id", None) == gid]
+                grouped = await self._find_album_messages(source_ent, gid, {msg_id})
                 if grouped:
-                    main_msgs = sorted(grouped, key=lambda m: m.id)
+                    main_msgs = grouped
         except (RPCError, OSError, TimeoutError) as exc:
             return False, f"暂时无法读取源消息: {exc}"
         if not main_msgs:
@@ -1380,12 +1428,13 @@ class AccountRunner:
         if not self.enabled:
             return
         msg = event.message
-        if msg.grouped_id is not None:
-            return
         await self.manager.refresh_if_changed()
         source_id = event.chat_id
         rules = self._rules_for_chat(source_id)
         if not rules:
+            return
+        if msg.grouped_id is not None:
+            self._queue_album(event)
             return
 
         chat = await event.get_chat()
@@ -1498,19 +1547,11 @@ class AccountRunner:
                     if self.manager.cfg.delay_seconds > 0:
                         await asyncio.sleep(self.manager.cfg.delay_seconds)
 
-    async def process_album(self, event: events.Album.Event) -> None:
-        if not self.enabled:
-            return
-        msgs = list(event.messages)
-        if not msgs:
-            return
-        await self.manager.refresh_if_changed()
-        source_id = event.chat_id
+    async def _process_album_messages(self, chat: Any, source_id: int, msgs: list[Any]) -> None:
         rules = self._rules_for_chat(source_id)
         if not rules:
             return
 
-        chat = await event.get_chat()
         source_title = self._entity_title(chat, source_id)
         self.chat_titles[source_id] = source_title
         lead_id = msgs[0].id
@@ -1580,7 +1621,8 @@ class AccountRunner:
                         continue
                     target_id = utils.get_peer_id(target_ent)
                     target_title = self.chat_titles.get(target_id, str(tgt))
-                    if self.manager.dedup.seen(source_id, lead_id, target_id, account_id=self.account_id):
+                    if all(self.manager.dedup.seen(source_id, msg.id, target_id, account_id=self.account_id)
+                           for msg in msgs):
                         continue
 
                     await self._deliver_album_to_target(

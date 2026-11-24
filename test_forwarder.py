@@ -41,6 +41,7 @@ class Audit(unittest.IsolatedAsyncioTestCase):
         runner._listen_task = None
         runner._send_lock = asyncio.Lock()
         runner._bg_tasks = set()
+        runner._pending_albums = {}
         runner.chats_cache = []
         runner.chat_titles = {}
         runner.target_cache = {TARGET: TARGET_PEER}
@@ -54,6 +55,55 @@ class Audit(unittest.IsolatedAsyncioTestCase):
 
     def record(self):
         return self.runner.manager.history.record.call_args.kwargs
+
+    async def test_album_looks_up_all_media_even_with_only_one_live_update(self):
+        runner = self.runner
+        settings = rule()
+        runner.source_map = {SOURCE: [settings]}
+        runner.manager.refresh_if_changed = AsyncMock()
+        photos = [post(i, media=MessageMediaPhoto()) for i in range(21, 26)]
+        for photo in photos:
+            photo.grouped_id = 301
+        adjacent = post(26, media=MessageMediaPhoto())
+        adjacent.grouped_id = 302
+        runner.client.get_messages = AsyncMock(return_value=[photos[2], adjacent, *photos[:2], *photos[3:]])
+        runner.client.forward_messages.return_value = [post(i) for i in range(30, 35)]
+        event = NS(chat_id=SOURCE, message=photos[0], get_chat=AsyncMock(return_value=CHAT))
+        with patch('forwarder.asyncio.sleep', new_callable=AsyncMock):
+            await runner.process_single(event)
+            await asyncio.gather(*runner._bg_tasks)
+        runner.client.forward_messages.assert_awaited_once()
+        self.assertEqual(runner.client.forward_messages.await_args.args[1], [21, 22, 23, 24, 25])
+        self.assertEqual(self.record()['item_count'], 5)
+
+    async def test_late_album_fragment_sends_only_newly_visible_media(self):
+        runner = self.runner
+        settings = rule()
+        runner.source_map = {SOURCE: [settings]}
+        runner.manager.refresh_if_changed = AsyncMock()
+        photos = [post(i, media=MessageMediaPhoto()) for i in range(21, 26)]
+        for photo in photos:
+            photo.grouped_id = 301
+        runner.client.get_messages = AsyncMock(return_value=photos[:2])
+        runner.client.forward_messages.side_effect = [[post(30), post(31)], [post(32), post(33), post(34)]]
+        with patch('forwarder.asyncio.sleep', new_callable=AsyncMock):
+            for photo, visible in ((photos[0], photos[:2]), (photos[2], photos)):
+                runner.client.get_messages = AsyncMock(return_value=visible)
+                await runner.process_single(NS(chat_id=SOURCE, message=photo, get_chat=AsyncMock(return_value=CHAT)))
+                await asyncio.gather(*runner._bg_tasks)
+        self.assertEqual([call.args[1] for call in runner.client.forward_messages.await_args_list], [[21, 22], [23, 24, 25]])
+
+    async def test_late_album_fragment_with_comments_keeps_existing_media(self):
+        runner = self.runner
+        settings = rule(collect_comments=True, comment_merge_mode='keep_batches')
+        photos = [post(i, media=MessageMediaPhoto()) for i in range(21, 26)]
+        for photo in photos:
+            photo.grouped_id = 301
+        runner.client.send_file.side_effect = [[post(30), post(31)], [post(32), post(33), post(34)]]
+        await self.merged(photos[:2], settings)
+        await self.merged(photos, settings)
+        self.assertEqual([call.args[1] for call in runner.client.send_file.await_args_list],
+                         [[p.media for p in photos[:2]], [p.media for p in photos[2:]]])
 
     async def test_token_rotation_revokes_existing_web_sessions(self):
         auth = AuthStore(self.tmp / 'auth.db')
