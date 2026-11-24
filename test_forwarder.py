@@ -467,6 +467,60 @@ class Audit(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, 2)
         self.assertEqual(r.client.send_file.await_count, 0, 'queued post still sent after rule removed from active routes')
 
+    async def test_updating_regex_during_comment_wait_keeps_queued_post_alive(self):
+        r = self.runner
+        entered, release = asyncio.Event(), asyncio.Event()
+        old_rule = rule(id='rule_photo_1', collect_comments=True, skip_patterns=['spam'])
+        new_rule = rule(id='rule_photo_1', collect_comments=True, skip_patterns=['spam|promo'])
+        r.source_map = {SOURCE: [old_rule]}
+        r.manager.cfg.rules = [old_rule]
+        r.client.send_file.return_value = post(55)
+
+        async def wait_before_fetch(_seconds):
+            entered.set()
+            await release.wait()
+
+        with patch('forwarder.asyncio.sleep', new=AsyncMock(side_effect=wait_before_fetch)):
+            r._schedule_comment_forward(CHAT, SOURCE, 'source', [post(1, 'normal photo', MessageMediaPhoto())], old_rule)
+            task = next(iter(r._bg_tasks))
+            await asyncio.wait_for(entered.wait(), 2)
+            # Simulate editing regex / saving settings while post is queued
+            r.source_map = {SOURCE: [new_rule]}
+            r.manager.cfg.rules = [new_rule]
+            release.set()
+            await asyncio.wait_for(task, 2)
+        r.client.send_file.assert_awaited_once()
+
+    async def test_slow_reupload_does_not_block_fast_copy_on_send_lock(self):
+        r = self.runner
+        dl_started, dl_release = asyncio.Event(), asyncio.Event()
+        r.source_map = {SOURCE: [rule()]}
+        r.client.forward_messages.return_value = post(99)
+        r.client.send_file.return_value = post(100)
+
+        async def slow_download(_msg, file=None, **_kw):
+            dl_started.set()
+            await dl_release.wait()
+            return 'dummy-video.mp4'
+
+        r.client.download_media = AsyncMock(side_effect=slow_download)
+
+        restricted_chat = NS(broadcast=True, noforwards=True)
+        slow_task = asyncio.create_task(
+            r._process_single_message(restricted_chat, SOURCE, post(10, 'vid', MessageMediaPhoto()), [rule()])
+        )
+        await asyncio.wait_for(dl_started.wait(), 2)
+
+        # While restricted video is still downloading, a fast copy must complete immediately without blocking!
+        await asyncio.wait_for(
+            r._process_single_message(CHAT, SOURCE, post(11, 'fast', MessageMediaPhoto()), [rule()]),
+            timeout=1.0,
+        )
+        r.client.forward_messages.assert_awaited_once()
+        dl_release.set()
+        await asyncio.wait_for(slow_task, 2)
+        r.client.send_file.assert_awaited_once()
+
     async def test_comment_mode_checks_every_main_album_caption(self):
         r = self.runner
         await self.merged([post(1, 'normal', MessageMediaPhoto()), post(2, 'advertisement', MessageMediaPhoto())],
