@@ -469,10 +469,11 @@ tbody tr:hover { background: rgba(127, 137, 151, 0.05); }
 .login-help { padding-top: 16px; margin-top: 20px; color: var(--text-3); border-top: 1px solid var(--line); font-size: 12px; }
 
 /* Toasts */
-.toast-stack { position: fixed; right: 24px; bottom: 24px; z-index: 95; display: flex; flex-direction: column; gap: 8px; max-width: 340px; }
+.toast-stack { position: fixed; top: 20px; right: 20px; z-index: 95; display: flex; flex-direction: column; gap: 8px; max-width: min(360px, calc(100vw - 40px)); pointer-events: none; }
 .toast {
   padding: 12px 15px; background: var(--surface-strong); border: 1px solid var(--line);
   border-left: 3px solid var(--accent); border-radius: 10px; box-shadow: var(--shadow); font-size: 13px;
+  pointer-events: auto;
 }
 .toast.success { border-left-color: var(--success); }
 .toast.danger { border-left-color: var(--danger); }
