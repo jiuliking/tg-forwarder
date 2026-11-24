@@ -23,6 +23,7 @@ from common import (
     build_media_chunks,
     clean_message_text,
     compile_rule_dict,
+    find_matched_regex_branches,
     load_config,
     save_raw_config,
     should_skip_text,
@@ -348,6 +349,14 @@ def test_history_pagination() -> None:
         assert filtered["total"] == len([i for i in range(1, 66) if i % 2 and i % 3 == 0])
 
 
+def test_find_matched_regex_branches() -> None:
+    pat = "(?i)担保|国际|信誉|广告|赛事|导航|引擎|商务|互推|付费|TRX|能量|自助|必备"
+    assert find_matched_regex_branches("已收录名单导航，自助会员群", pat) == ["导航", "自助"]
+    assert find_matched_regex_branches("1trx能量闪租", pat) == ["TRX", "能量"]
+    assert find_matched_regex_branches("独家广告投放", "(?i)(?:担保|广告|外围)") == ["广告"]
+    assert find_matched_regex_branches("contains foo here", r"a\|b|foo") == ["foo"]
+
+
 if __name__ == "__main__":
     test_clean_preserves_utf16_entities()
     test_strip_all_text_still_runs_skip_filter()
@@ -357,6 +366,7 @@ if __name__ == "__main__":
     test_media_bucket_classification()
     test_auth_change_password_revokes_other_sessions_and_chmod_600()
     test_phone_2fa_does_not_resubmit_otp()
+    test_find_matched_regex_branches()
     test_stores_and_config_roundtrip()
     test_history_pagination()
     print("ALL TESTS PASSED")

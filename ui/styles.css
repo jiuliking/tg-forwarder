@@ -368,6 +368,18 @@ html[data-theme='dark'] .btn.primary:hover:not(:disabled) { background: #ffffff;
 html[data-theme='dark'] .badge.other-src { border-color: rgba(216, 189, 128, 0.3); }
 html[data-theme='dark'] .badge.other-tgt { border-color: rgba(191, 164, 230, 0.3); }
 
+.regex-hit {
+  color: #dc2626;
+  background: rgba(220, 38, 38, 0.1);
+  font-weight: 600;
+  padding: 0 3px;
+  border-radius: 4px;
+}
+html[data-theme='dark'] .regex-hit {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.16);
+}
+
 /* Metric Cards (Log Manage) */
 .metrics-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
 .metric-card {

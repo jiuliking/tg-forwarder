@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -300,6 +301,114 @@ def should_skip_text(text: str, rule: CompiledRule) -> Optional[str]:
     return None
 
 
+def _split_top_level_alternation(body: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    escaped = False
+    in_class = False
+    depth = 0
+    for ch in body:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            buf.append(ch)
+            escaped = True
+            continue
+        if in_class:
+            buf.append(ch)
+            if ch == "]":
+                in_class = False
+            continue
+        if ch == "[":
+            in_class = True
+            buf.append(ch)
+        elif ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "|" and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return parts
+
+
+def _unwrap_single_group(body: str) -> tuple[str, str, str]:
+    if not (body.startswith("(") and body.endswith(")")):
+        return "", body, ""
+    escaped = False
+    in_class = False
+    depth = 0
+    for i, ch in enumerate(body):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if in_class:
+            if ch == "]":
+                in_class = False
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and i < len(body) - 1:
+                return "", body, ""
+    if body.startswith("(?:"):
+        return "(?:", body[3:-1], ")"
+    if body.startswith("(?"):
+        return "", body, ""
+    return "(", body[1:-1], ")"
+
+
+def find_matched_regex_branches(text: Optional[str], pattern: str) -> list[str]:
+    if not text or not pattern:
+        return []
+    flags = re.MULTILINE
+    body = pattern
+    m_flag = re.match(r"^\(\?([aiLmsux]+)\)", body)
+    if m_flag:
+        fl = m_flag.group(1)
+        if "i" in fl:
+            flags |= re.IGNORECASE
+        if "s" in fl:
+            flags |= re.DOTALL
+        if "x" in fl:
+            flags |= re.VERBOSE
+        if "a" in fl:
+            flags |= re.ASCII
+        body = body[m_flag.end() :]
+
+    parts = _split_top_level_alternation(body)
+    if len(parts) == 1:
+        _, inner, _ = _unwrap_single_group(body)
+        if inner != body:
+            parts = _split_top_level_alternation(inner)
+
+    hits: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if not part or part in seen:
+            continue
+        try:
+            if re.search(part, text, flags):
+                seen.add(part)
+                hits.append(part)
+        except re.error:
+            continue
+    return hits
+
+
 def should_strip_all_text(text: str, rule: CompiledRule) -> Optional[str]:
     if not text:
         return None
@@ -549,7 +658,8 @@ class HistoryStore:
                 mode TEXT NOT NULL,
                 status TEXT NOT NULL,
                 preview TEXT NOT NULL DEFAULT '',
-                detail TEXT NOT NULL DEFAULT ''
+                detail TEXT NOT NULL DEFAULT '',
+                matched_terms TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -558,6 +668,8 @@ class HistoryStore:
             self.conn.execute("ALTER TABLE history ADD COLUMN account_id TEXT NOT NULL DEFAULT 'default'")
         if "account_name" not in cols:
             self.conn.execute("ALTER TABLE history ADD COLUMN account_name TEXT NOT NULL DEFAULT '默认账号'")
+        if "matched_terms" not in cols:
+            self.conn.execute("ALTER TABLE history ADD COLUMN matched_terms TEXT NOT NULL DEFAULT ''")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts DESC)")
         self.conn.commit()
 
@@ -577,13 +689,15 @@ class HistoryStore:
         status: str,
         preview: str = "",
         detail: str = "",
+        matched_terms: Sequence[str] = (),
     ) -> None:
         snippet = (preview or "").replace("\n", " ").strip()[:160]
+        terms_json = json.dumps(list(matched_terms), ensure_ascii=False) if matched_terms else ""
         self.conn.execute(
             """
             INSERT INTO history
-            (ts, account_id, account_name, rule_name, source_id, source_title, target_id, target_title, msg_id, item_count, mode, status, preview, detail)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ts, account_id, account_name, rule_name, source_id, source_title, target_id, target_title, msg_id, item_count, mode, status, preview, detail, matched_terms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(time.time()),
@@ -600,6 +714,7 @@ class HistoryStore:
                 status,
                 snippet,
                 (detail or "")[:400],
+                terms_json[:500],
             ),
         )
         self._apply_prune_sql(self.retention_days, self.max_rows)

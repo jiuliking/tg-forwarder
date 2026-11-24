@@ -39,6 +39,7 @@ from common import (
     HistoryStore,
     build_media_chunks,
     clean_message_text,
+    find_matched_regex_branches,
     load_config,
     load_env_file,
     load_raw_config,
@@ -653,6 +654,7 @@ class AccountRunner:
                         status="skipped",
                         preview=raw_preview,
                         detail=f"命中跳过正则: {matched_skip}",
+                        matched_terms=find_matched_regex_branches(chosen_text, matched_skip),
                     )
                     return False, f"命中跳过正则: {matched_skip}"
 
@@ -1389,6 +1391,7 @@ class AccountRunner:
                         status="skipped",
                         preview=raw_text or "[媒体消息]",
                         detail=f"命中跳过正则: {matched_skip}",
+                        matched_terms=find_matched_regex_branches(raw_text, matched_skip),
                     )
                     continue
 
@@ -1493,12 +1496,15 @@ class AccountRunner:
         async with self._send_lock:
             for rule in normal_rules:
                 skip_hit = None
+                skip_source_text = ""
                 for m in msgs:
                     skip_hit = should_skip_text(m.message or "", rule)
-                    if skip_hit:
+                    if skip_hit is not None:
+                        skip_source_text = m.message or ""
                         break
-                if skip_hit:
+                if skip_hit is not None:
                     log.info("[%s/%s] Skip album %s (matched %r)", self.account_name, rule.name, lead_id, skip_hit)
+                    first_txt = next((m.message for m in msgs if m.message), "[相册]")
                     self.manager.history.record(
                         account_id=self.account_id,
                         account_name=self.account_name,
@@ -1511,8 +1517,9 @@ class AccountRunner:
                         item_count=len(msgs),
                         mode="skip_regex",
                         status="skipped",
-                        preview=raw_preview,
+                        preview=first_txt,
                         detail=f"命中跳过正则: {skip_hit}",
+                        matched_terms=find_matched_regex_branches(skip_source_text, skip_hit),
                     )
                     continue
 

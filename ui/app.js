@@ -436,6 +436,133 @@
     return out;
   }
 
+  function splitTopLevelAlternation(body) {
+    const parts = [];
+    let buf = '';
+    let escaped = false;
+    let inClass = false;
+    let depth = 0;
+    for (let i = 0; i < body.length; i++) {
+      const ch = body[i];
+      if (escaped) {
+        buf += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        buf += ch;
+        escaped = true;
+        continue;
+      }
+      if (inClass) {
+        buf += ch;
+        if (ch === ']') inClass = false;
+        continue;
+      }
+      if (ch === '[') {
+        inClass = true;
+        buf += ch;
+      } else if (ch === '(') {
+        depth += 1;
+        buf += ch;
+      } else if (ch === ')') {
+        depth = Math.max(0, depth - 1);
+        buf += ch;
+      } else if (ch === '|' && depth === 0) {
+        parts.push(buf);
+        buf = '';
+      } else {
+        buf += ch;
+      }
+    }
+    parts.push(buf);
+    return parts;
+  }
+
+  function unwrapSingleGroup(body) {
+    if (!body.startsWith('(') || !body.endsWith(')')) return ['', body, ''];
+    let escaped = false;
+    let inClass = false;
+    let depth = 0;
+    for (let i = 0; i < body.length; i++) {
+      const ch = body[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (inClass) {
+        if (ch === ']') inClass = false;
+        continue;
+      }
+      if (ch === '[') inClass = true;
+      else if (ch === '(') depth += 1;
+      else if (ch === ')') {
+        depth -= 1;
+        if (depth === 0 && i < body.length - 1) return ['', body, ''];
+      }
+    }
+    if (body.startsWith('(?:')) return ['(?:', body.slice(3, -1), ')'];
+    if (body.startsWith('(?')) return ['', body, ''];
+    return ['(', body.slice(1, -1), ')'];
+  }
+
+  function renderLogDetail(it) {
+    const detail = String(it.detail || '');
+    const m = detail.match(/^(命中跳过正则[:：]\s*)(.+)$/);
+    if (!m) return esc(detail);
+
+    const prefix = m[1];
+    let body = m[2];
+    let flagPrefix = '';
+    let jsFlags = 'm';
+    const fm = body.match(/^\(\?([aiLmsux]+)\)/);
+    if (fm) {
+      flagPrefix = fm[0];
+      const fl = fm[1];
+      if (fl.includes('i')) jsFlags += 'i';
+      if (fl.includes('s')) jsFlags += 's';
+      body = body.slice(fm[0].length);
+    }
+
+    const savedHits = new Set();
+    if (it.matched_terms) {
+      try {
+        const arr = typeof it.matched_terms === 'string' ? JSON.parse(it.matched_terms) : it.matched_terms;
+        if (Array.isArray(arr)) arr.forEach((t) => savedHits.add(String(t)));
+      } catch {}
+    }
+
+    let openWrap = '';
+    let closeWrap = '';
+    let parts = splitTopLevelAlternation(body);
+    if (parts.length === 1) {
+      const [ow, inner, cw] = unwrapSingleGroup(body);
+      if (inner !== body) {
+        openWrap = ow;
+        closeWrap = cw;
+        parts = splitTopLevelAlternation(inner);
+      }
+    }
+
+    const previewText = String(it.preview || '');
+    const partsHtml = parts.map((part) => {
+      if (!part) return '';
+      let hit = savedHits.has(part);
+      if (!hit && previewText) {
+        try {
+          hit = new RegExp(part, jsFlags).test(previewText);
+        } catch {}
+      }
+      return hit ? `<mark class="regex-hit">${esc(part)}</mark>` : esc(part);
+    });
+
+    return `${esc(prefix)}${esc(flagPrefix)}${esc(openWrap)}${partsHtml.join('|')}${esc(closeWrap)}`;
+  }
+
   function renderLogs() {
     const items = state.logs.items || [];
     const total = Number(state.logs.total || 0);
@@ -502,7 +629,7 @@
                     <td>${esc(it.source_title)} → ${esc(it.target_title)}</td>
                     <td>
                       <div>${esc(it.preview || '[媒体消息]')}</div>
-                      ${it.detail ? `<div class="hint" style="color:${it.status === 'error' ? 'var(--danger)' : 'var(--text-3)'}">${esc(it.detail)}</div>` : ''}
+                      ${it.detail ? `<div class="hint" style="color:${it.status === 'error' ? 'var(--danger)' : 'var(--text-3)'}">${renderLogDetail(it)}</div>` : ''}
                     </td>
                     <td style="white-space:nowrap">
                       ${
