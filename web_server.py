@@ -137,10 +137,12 @@ class WebConsole:
         css_v = self._asset_version("styles.css")
         js_v = self._asset_version("app.js")
         svg_v = self._asset_version("favicon.svg")
+        ico_v = self._asset_version("favicon.ico")
         png_v = self._asset_version("apple-touch-icon.png")
         html = html.replace("/assets/styles.css", f"/assets/styles.css?v={css_v}")
         html = html.replace("/assets/app.js", f"/assets/app.js?v={js_v}")
         html = html.replace("/assets/favicon.svg", f"/assets/favicon.svg?v={svg_v}")
+        html = html.replace("/favicon.ico", f"/favicon.ico?v={ico_v}")
         html = html.replace("/assets/apple-touch-icon.png", f"/assets/apple-touch-icon.png?v={png_v}")
         return web.Response(
             text=html,
