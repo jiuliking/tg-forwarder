@@ -7,6 +7,8 @@ global:
   album_quiet_seconds: 15       # 同组没有新增媒体的等待时间（秒）
   album_max_wait_seconds: 45    # 从首项开始计时，必须不小于静默等待时间
   comment_wait_seconds: 30
+  comment_silence_seconds: 30   # 评论区最后一条作者评论未满该秒数时继续顺延
+  comment_max_extra_seconds: 180 # 评论区在等待窗口之外最多再顺延的总秒数（0 表示不顺延）
   comment_merge_mode: pack
   # Optional: override .env Telegram API credentials from Web UI or here
   # api_id: 12345678

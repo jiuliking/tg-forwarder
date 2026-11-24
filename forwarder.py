@@ -68,8 +68,6 @@ logging.basicConfig(
 log = logging.getLogger("tg-forwarder")
 
 ALBUM_FIRST_READ_SECONDS = 4
-COMMENT_SILENCE_SECONDS = 30
-COMMENT_MAX_EXTRA_SECONDS = 180
 RECOVERY_CHECKPOINT_SECONDS = 30
 RECOVERY_OVERLAP_SECONDS = 120
 RECOVERY_MAX_LOOKBACK_SECONDS = 30 * 60
@@ -309,7 +307,7 @@ class AccountRunner:
 
     def _recovery_settle_seconds(self, rules: list[CompiledRule]) -> int:
         comment_delay = max(
-            (rule.comment_wait_seconds + COMMENT_MAX_EXTRA_SECONDS for rule in rules if rule.collect_comments),
+            (rule.comment_wait_seconds + self.manager.cfg.comment_max_extra_seconds for rule in rules if rule.collect_comments),
             default=0,
         )
         return self.manager.cfg.album_max_wait_seconds + comment_delay
@@ -878,8 +876,10 @@ class AccountRunner:
         try:
             if not skip_wait:
                 wait_s = max(5, rule.comment_wait_seconds)
+                silence_s = max(5, self.manager.cfg.comment_silence_seconds)
+                extra_s = max(0, self.manager.cfg.comment_max_extra_seconds)
                 start_ts = time.time()
-                max_deadline = start_ts + wait_s + COMMENT_MAX_EXTRA_SECONDS
+                max_deadline = start_ts + wait_s + extra_s
 
                 await asyncio.sleep(wait_s)
                 if not is_active():
@@ -888,7 +888,7 @@ class AccountRunner:
                 comment_batches, fb_text, fb_entities, latest_ts = await self._fetch_channel_comment_batches(
                     chat, source_id, thread_msg_id
                 )
-                while latest_ts > 0 and (time.time() - latest_ts) < COMMENT_SILENCE_SECONDS and time.time() < max_deadline:
+                while extra_s > 0 and latest_ts > 0 and (time.time() - latest_ts) < silence_s and time.time() < max_deadline:
                     await asyncio.sleep(5)
                     if not is_active():
                         return False, "规则已停用或修改"

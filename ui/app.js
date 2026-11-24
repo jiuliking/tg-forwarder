@@ -1130,13 +1130,13 @@
           <div class="settings-group">
             <div class="settings-group-head">
               <span class="settings-group-title">评论区默认参数</span>
-              <span class="settings-group-sub">规则开启「抓取评论区」且未单独覆盖时默认使用</span>
+              <span class="settings-group-sub">控制评论区初次等待、持续顺延机制与默认分组方式</span>
             </div>
             <div class="settings-grid-2">
               <div class="field">
                 <label for="set-comment-wait">评论区默认等待收集窗口（秒）</label>
                 <input id="set-comment-wait" type="number" min="5" max="300" step="1" required value="${esc(s.comment_wait_seconds ?? 30)}" />
-                <span class="hint">作者仍在继续传图时会自动顺延等待</span>
+                <span class="hint">主帖发出后先等待该时长再首次抓取评论；规则未单独覆盖时默认使用</span>
               </div>
               <div class="field">
                 <label for="set-comment-mode">评论区默认媒体分组方式</label>
@@ -1144,7 +1144,17 @@
                   <option value="pack" ${(s.comment_merge_mode || 'pack') === 'pack' ? 'selected' : ''}>自动凑满（保留主帖原相册，每组最多 10 项）</option>
                   <option value="keep_batches" ${s.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>按原批次发送（保持主帖与每条评论各自数量）</option>
                 </select>
-                <span class="hint">决定主帖与作者评论媒体合并时的相册拆分方式</span>
+                <span class="hint">决定主帖与作者评论媒体合并时的相册拆分方式（可在单条规则覆盖）</span>
+              </div>
+              <div class="field">
+                <label for="set-comment-silence">评论区静默顺延（秒）</label>
+                <input id="set-comment-silence" type="number" min="5" max="300" step="1" required value="${esc(s.comment_silence_seconds ?? 30)}" />
+                <span class="hint">抓取时若最后一条作者评论距今未满此时长，继续每 5 秒轮询等下一批补图；建议 ≥ 25 覆盖多组上传间隔</span>
+              </div>
+              <div class="field">
+                <label for="set-comment-max-extra">评论区额外顺延上限（秒）</label>
+                <input id="set-comment-max-extra" type="number" min="0" max="600" step="1" required value="${esc(s.comment_max_extra_seconds ?? 180)}" />
+                <span class="hint">在等待窗口之外最多再顺延的总时长（设 0 不顺延）；若作者提前停止传图会立即发出，不会白白等满</span>
               </div>
             </div>
           </div>
@@ -1626,6 +1636,7 @@
           <p class="page-sub">转发规则配置详解与多账号功能速查</p>
         </div>
         <div class="page-actions">
+          <button class="btn" data-nav="/settings">去全局设置</button>
           <button class="btn primary" data-nav="/rules">去配置规则</button>
         </div>
       </div>
@@ -1697,7 +1708,46 @@
 
       <section class="panel">
         <div class="panel-head">
-          <h2 class="panel-title">二、其他页面简略说明</h2>
+          <h2 class="panel-title">二、相册与评论区等待时间详解（全局设置）</h2>
+          <span class="badge muted">防漏图 · 防截断</span>
+        </div>
+
+        <div class="stack">
+          <div class="guide-item">
+            <strong>1. 相册收集：为什么有「静默等待」和「最长收集时间」？</strong>
+            <ul class="guide-list">
+              <li><b>工作原理</b>：Telegram 发送一组多图/视频相册时，客户端往往分几批推送消息。收到第一项后，系统先等待约 4 秒并去源频道回查同组消息；只要发现有新成员加入，就会重置「静默计时」。</li>
+              <li><b>相册静默等待（秒，默认 15）</b>：同组消息连续这么久没有新增任何媒体，就认为主帖相册已经收齐，立刻开始转发或进入评论等待。</li>
+              <li><b>相册最长收集时间（秒，默认 45）</b>：从收到第一项开始算起的总兜底上限（必须 ≥ 静默等待）。即使某组媒体一直断断续续到达，到了该上限也会强制收口发出；<b>如果已经凑满 Telegram 单组上限 10 项，会直接提前发出</b>，不用死等。</li>
+            </ul>
+          </div>
+
+          <div class="guide-item">
+            <strong>2. 评论区抓取：三个时间参数如何协同工作？</strong>
+            <ul class="guide-list">
+              <li><b>第 1 阶段 · 等待收集窗口（默认 30 秒，单条规则可覆盖）</b>：主帖相册集齐后，先休眠该时长再第一次去评论区抓取「频道马甲」发的补图/视频。适合留出作者在评论区开传第一批图的时间（搬运套图/写真类频道建议在规则里设成 <span class="code-snip">45～60</span> 秒）。</li>
+              <li><b>第 2 阶段 · 静默顺延（默认 30 秒，范围 5～300）</b>：等待窗口到期去抓评论时，如果<b>最后一条作者评论距今未满该时长</b>，说明作者很可能还在继续传下一批，系统会每 5 秒轮询一次，每次抓到新评论就按最新一条重新计算静默，直到连续满「静默顺延」秒都没有新图为止。<br/>
+                <i>经验值</i>：作者每传 1 批 10 张图通常需要 15～25 秒，因此静默顺延建议设 <b>25～40 秒</b>；若设得太小（如 10 秒），容易在两批图之间被提前截断。</li>
+              <li><b>第 3 阶段 · 额外顺延上限（默认 180 秒，范围 0～600）</b>：在「等待收集窗口」之外，最多允许继续顺延的总时长（设 <span class="code-snip">0</span> 表示到点即发、不启用顺延）。<br/>
+                <i>不会白白等满</i>：如果主帖根本没有评论、或作者早就传完，系统在窗口到期（或静默满阈值）后立刻就发，完全不会拖到上限。</li>
+              <li><b>举个例子</b>：某套图主帖 10 张 + 评论区 5 批共 50 张，每批间隔 20 秒。配置为「收集窗口 60 秒 + 静默顺延 30 秒 + 额外上限 180 秒」时：第 60 秒抓到第 1 批（距今 11 秒 &lt; 30 秒）→ 自动每 5 秒轮询接住第 2～5 批 → 第 5 批结束后再静默确认 30 秒无新图 → 整套 60 张一次完整发出。</li>
+            </ul>
+          </div>
+
+          <div class="guide-item">
+            <strong>3. 基础转发参数速查</strong>
+            <ul class="guide-list">
+              <li><b>转发间隔（秒）</b>：每次向目标频道发帖后的停顿时间，建议 ≥ 1.0 秒避免触发 Telegram FloodWait 限流。</li>
+              <li><b>受限频道单次下载上限（MB）</b>：仅针对开启了「禁止转发」的频道兜底下载重传生效，超出该体积的单个文件会跳过。</li>
+              <li><b>消息去重保留时长（小时）</b>：已转发消息 ID 在此时长内不会重复搬运（包括自动回查补发），过期后自动清理旧记录。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">三、其他页面简略说明</h2>
         </div>
         <div class="form-grid">
           <div class="guide-item">
@@ -1710,11 +1760,11 @@
           </div>
           <div class="guide-item">
             <strong>转发记录</strong>
-            <p class="hint" style="margin:6px 0 0">按账号/状态/规则筛选搬运记录：无来源秒转、无下载清洗、下载重传或广告拦截。</p>
+            <p class="hint" style="margin:6px 0 0">按账号/状态/规则筛选搬运记录：无来源秒转、无下载清洗、下载重传、评论合并或广告拦截，支持单条手动重发。</p>
           </div>
           <div class="guide-item">
             <strong>全局设置 & 正则管理</strong>
-            <p class="hint" style="margin:6px 0 0">调节发帖间隔、下载上限与免密 Token；正则管理统一维护可复用的过滤正则库，内置关键词生成与实时测试。</p>
+            <p class="hint" style="margin:6px 0 0">调节发帖间隔、相册/评论等待与顺延时间、下载上限与免密 Token；正则管理统一维护可复用的过滤正则库，内置关键词生成与实时测试。</p>
           </div>
         </div>
       </section>`;
@@ -2863,6 +2913,8 @@
           album_quiet_seconds: Number(document.getElementById('set-album-quiet').value),
           album_max_wait_seconds: Number(document.getElementById('set-album-max-wait').value),
           comment_wait_seconds: Number(document.getElementById('set-comment-wait').value),
+          comment_silence_seconds: Number(document.getElementById('set-comment-silence').value),
+          comment_max_extra_seconds: Number(document.getElementById('set-comment-max-extra').value),
           comment_merge_mode: document.getElementById('set-comment-mode').value,
         };
         if (!Number.isInteger(payload.album_quiet_seconds) || payload.album_quiet_seconds < 1 || payload.album_quiet_seconds > 300) {
@@ -2875,6 +2927,14 @@
         }
         if (payload.album_max_wait_seconds < payload.album_quiet_seconds) {
           toast('相册最长收集时间必须大于或等于静默等待时间', 'danger');
+          return;
+        }
+        if (!Number.isInteger(payload.comment_silence_seconds) || payload.comment_silence_seconds < 5 || payload.comment_silence_seconds > 300) {
+          toast('评论区静默顺延必须是 5 到 300 秒的整数', 'danger');
+          return;
+        }
+        if (!Number.isInteger(payload.comment_max_extra_seconds) || payload.comment_max_extra_seconds < 0 || payload.comment_max_extra_seconds > 600) {
+          toast('评论区额外顺延上限必须是 0 到 600 秒的整数', 'danger');
           return;
         }
         try {

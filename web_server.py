@@ -20,6 +20,7 @@ from common import (
     compile_rule_dict,
     load_raw_config,
     parse_album_wait_settings,
+    parse_comment_extend_settings,
     resolve_rule_patterns,
     resolve_tg_api,
     save_raw_config,
@@ -759,6 +760,7 @@ class WebConsole:
         raw = load_raw_config(self.config_path)
         g = raw.get("global") or {}
         album_quiet, album_max_wait = parse_album_wait_settings(g)
+        comment_silence, comment_max_extra = parse_comment_extend_settings(g)
         api_id, api_hash, is_custom = resolve_tg_api(raw)
         masked_hash = (
             (api_hash[:4] + "****" + api_hash[-4:])
@@ -773,6 +775,8 @@ class WebConsole:
                 "album_quiet_seconds": album_quiet,
                 "album_max_wait_seconds": album_max_wait,
                 "comment_wait_seconds": max(5, min(300, int(g.get("comment_wait_seconds", 30) or 30))),
+                "comment_silence_seconds": comment_silence,
+                "comment_max_extra_seconds": comment_max_extra,
                 "comment_merge_mode": (
                     "keep_batches" if str(g.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
                 ),
@@ -799,11 +803,12 @@ class WebConsole:
             raw = load_raw_config(self.config_path)
             g = raw.setdefault("global", {})
 
-            for key in ("album_quiet_seconds", "album_max_wait_seconds"):
+            for key in ("album_quiet_seconds", "album_max_wait_seconds", "comment_silence_seconds", "comment_max_extra_seconds"):
                 if key in data:
                     g[key] = data[key]
             try:
                 parse_album_wait_settings(g)
+                parse_comment_extend_settings(g)
             except ValueError as exc:
                 return web.json_response({"error": str(exc)}, status=400)
 

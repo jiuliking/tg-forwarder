@@ -49,7 +49,8 @@ class Audit(unittest.IsolatedAsyncioTestCase):
         runner.source_map = {}
         runner._source_activated_at = {}
         runner.manager = NS(cfg=NS(delay_seconds=0, max_download_mb=100, temp_dir=self.tmp,
-                                   album_quiet_seconds=15, album_max_wait_seconds=45),
+                                   album_quiet_seconds=15, album_max_wait_seconds=45,
+                                   comment_silence_seconds=30, comment_max_extra_seconds=180),
                             dedup=DedupStore(self.tmp / 'db'), history=NS(record=Mock(), skipped_rule_names=Mock(return_value=set())))
         self.addCleanup(runner.manager.dedup.conn.close)
         runner.client = NS(send_file=AsyncMock(), send_message=AsyncMock(), forward_messages=AsyncMock(),
@@ -74,20 +75,28 @@ class Audit(unittest.IsolatedAsyncioTestCase):
             async with client.get('/api/settings', headers=headers) as response:
                 body = await response.json()
                 self.assertEqual((body.get('album_quiet_seconds'), body.get('album_max_wait_seconds')), (15, 45))
+                self.assertEqual((body.get('comment_silence_seconds'), body.get('comment_max_extra_seconds')), (30, 180))
             async with client.put('/api/settings', headers=headers,
-                                  json={'album_quiet_seconds': 25, 'album_max_wait_seconds': 65}) as response:
+                                  json={'album_quiet_seconds': 25, 'album_max_wait_seconds': 65,
+                                        'comment_silence_seconds': 40, 'comment_max_extra_seconds': 240}) as response:
                 self.assertEqual(response.status, 200)
             self.assertEqual(self.runner.manager.cfg.album_quiet_seconds, 25)
             self.assertEqual(self.runner.manager.cfg.album_max_wait_seconds, 65)
+            self.assertEqual(self.runner.manager.cfg.comment_silence_seconds, 40)
+            self.assertEqual(self.runner.manager.cfg.comment_max_extra_seconds, 240)
             saved = cfg.read_bytes()
             for invalid in ({'album_max_wait_seconds': 20}, {'album_quiet_seconds': 1.5},
-                            {'album_quiet_seconds': True}, {'album_max_wait_seconds': 301}):
+                            {'album_quiet_seconds': True}, {'album_max_wait_seconds': 301},
+                            {'comment_silence_seconds': 4}, {'comment_silence_seconds': 301},
+                            {'comment_max_extra_seconds': -1}, {'comment_max_extra_seconds': 601},
+                            {'comment_silence_seconds': True}):
                 async with client.put('/api/settings', headers=headers, json=invalid) as response:
                     self.assertEqual(response.status, 400)
                 self.assertEqual(cfg.read_bytes(), saved)
             async with client.get('/api/settings', headers=headers) as response:
                 body = await response.json()
                 self.assertEqual((body['album_quiet_seconds'], body['album_max_wait_seconds']), (25, 65))
+                self.assertEqual((body['comment_silence_seconds'], body['comment_max_extra_seconds']), (40, 240))
         self.runner.manager.reload_all.assert_awaited_once_with(force=True)
 
     async def test_new_album_uses_the_global_wait_values(self):

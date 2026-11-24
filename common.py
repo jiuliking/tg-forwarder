@@ -81,6 +81,8 @@ class CompiledRule:
 
 DEFAULT_ALBUM_QUIET_SECONDS = 15
 DEFAULT_ALBUM_MAX_WAIT_SECONDS = 45
+DEFAULT_COMMENT_SILENCE_SECONDS = 30
+DEFAULT_COMMENT_MAX_EXTRA_SECONDS = 180
 
 
 @dataclass
@@ -95,6 +97,8 @@ class AppConfig:
     log_max_rows: int = 5000
     album_quiet_seconds: int = DEFAULT_ALBUM_QUIET_SECONDS
     album_max_wait_seconds: int = DEFAULT_ALBUM_MAX_WAIT_SECONDS
+    comment_silence_seconds: int = DEFAULT_COMMENT_SILENCE_SECONDS
+    comment_max_extra_seconds: int = DEFAULT_COMMENT_MAX_EXTRA_SECONDS
 
 
 REGEX_KINDS = ("skip", "strip_text", "strip", "replace")
@@ -308,8 +312,20 @@ def parse_album_wait_settings(settings: dict[str, Any]) -> tuple[int, int]:
     return quiet, maximum
 
 
+def parse_comment_extend_settings(settings: dict[str, Any]) -> tuple[int, int]:
+    silence = settings.get("comment_silence_seconds", DEFAULT_COMMENT_SILENCE_SECONDS)
+    extra = settings.get("comment_max_extra_seconds", DEFAULT_COMMENT_MAX_EXTRA_SECONDS)
+    if type(silence) is not int or not 5 <= silence <= 300:
+        raise ValueError("评论区静默顺延必须是 5 到 300 秒的整数")
+    if type(extra) is not int or not 0 <= extra <= 600:
+        raise ValueError("评论区额外顺延上限必须是 0 到 600 秒的整数")
+    return silence, extra
+
+
 def save_raw_config(config_path: Path, data: dict[str, Any]) -> None:
-    parse_album_wait_settings(data.get("global") or {})
+    g = data.get("global") or {}
+    parse_album_wait_settings(g)
+    parse_comment_extend_settings(g)
     regex_rules = data.get("regex_rules") or []
     validated_regex = [validate_regex_rule_dict(rx) for rx in regex_rules]
     if "regex_rules" in data or validated_regex:
@@ -344,6 +360,7 @@ def load_config(config_path: Path) -> AppConfig:
     raw = load_raw_config(config_path)
     g = raw.get("global") or {}
     album_quiet, album_max_wait = parse_album_wait_settings(g)
+    comment_silence, comment_max_extra = parse_comment_extend_settings(g)
     accounts_out = [
         AccountConfig(
             id=str(a.get("id") or "default").strip(),
@@ -370,6 +387,8 @@ def load_config(config_path: Path) -> AppConfig:
         log_max_rows=max(100, int(g.get("log_max_rows", 5000))),
         album_quiet_seconds=album_quiet,
         album_max_wait_seconds=album_max_wait,
+        comment_silence_seconds=comment_silence,
+        comment_max_extra_seconds=comment_max_extra,
     )
 
 
