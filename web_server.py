@@ -136,8 +136,12 @@ class WebConsole:
         html = (self.ui_dir / "index.html").read_text(encoding="utf-8")
         css_v = self._asset_version("styles.css")
         js_v = self._asset_version("app.js")
+        svg_v = self._asset_version("favicon.svg")
+        png_v = self._asset_version("apple-touch-icon.png")
         html = html.replace("/assets/styles.css", f"/assets/styles.css?v={css_v}")
         html = html.replace("/assets/app.js", f"/assets/app.js?v={js_v}")
+        html = html.replace("/assets/favicon.svg", f"/assets/favicon.svg?v={svg_v}")
+        html = html.replace("/assets/apple-touch-icon.png", f"/assets/apple-touch-icon.png?v={png_v}")
         return web.Response(
             text=html,
             content_type="text/html",
@@ -147,6 +151,15 @@ class WebConsole:
                 "Pragma": "no-cache",
             },
         )
+
+    async def handle_favicon(self, _request: web.Request) -> web.StreamResponse:
+        ico = self.ui_dir / "favicon.ico"
+        if ico.exists():
+            return web.FileResponse(ico, headers={"Cache-Control": "public, max-age=86400"})
+        svg = self.ui_dir / "favicon.svg"
+        if svg.exists():
+            return web.FileResponse(svg, headers={"Cache-Control": "public, max-age=86400"})
+        raise web.HTTPNotFound()
 
     async def handle_healthz(self, _request: web.Request) -> web.Response:
         return web.json_response({"ok": True})
@@ -932,6 +945,7 @@ class WebConsole:
         app = web.Application(middlewares=[self.auth_middleware])
         app.on_response_prepare.append(self._on_response_prepare)
         app.router.add_get("/", self.handle_index)
+        app.router.add_get("/favicon.ico", self.handle_favicon)
         app.router.add_get("/api/healthz", self.handle_healthz)
         app.router.add_get("/api/auth/status", self.handle_auth_status)
         app.router.add_post("/api/auth/login", self.handle_login)
