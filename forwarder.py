@@ -5,7 +5,9 @@ import shutil
 import signal
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any, Optional
 
 from aiohttp import web
@@ -65,6 +67,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-forwarder")
 
+ALBUM_QUIET_SECONDS = 15
+ALBUM_MAX_WAIT_SECONDS = 45
+ALBUM_FIRST_READ_SECONDS = 4
+
+
+@dataclass
+class PendingAlbum:
+    anchors: set[int]
+    started_at: float
+    last_update_at: float
+
 
 class AccountRunner:
     def __init__(
@@ -92,7 +105,7 @@ class AccountRunner:
         self._send_lock = asyncio.Lock()
         self._auth_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task[Any]] = set()
-        self._pending_albums: dict[tuple[int, int], set[int]] = {}
+        self._pending_albums: dict[tuple[int, int], PendingAlbum] = {}
         self._handlers_attached = False
         self.listening = False
         self._listen_task: Optional[asyncio.Task[None]] = None
@@ -561,45 +574,58 @@ class AccountRunner:
 
     def _queue_album(self, event: events.NewMessage.Event) -> None:
         key = (event.chat_id, event.message.grouped_id)
-        if key in self._pending_albums:
-            self._pending_albums[key].add(event.message.id)
+        pending = self._pending_albums.get(key)
+        if pending is not None:
+            if event.message.id not in pending.anchors:
+                pending.anchors.add(event.message.id)
+                pending.last_update_at = monotonic()
             return
-        anchors = {event.message.id}
-        self._pending_albums[key] = anchors
-        task = asyncio.create_task(self._assemble_album(event, key, anchors))
+        now = monotonic()
+        pending = PendingAlbum({event.message.id}, now, now)
+        self._pending_albums[key] = pending
+        task = asyncio.create_task(self._assemble_album(event, key, pending))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
-    async def _assemble_album(self, event: events.NewMessage.Event, key: tuple[int, int], anchors: set[int]) -> None:
+    async def _assemble_album(self, event: events.NewMessage.Event, key: tuple[int, int], pending: PendingAlbum) -> None:
         source_id, group_id = key
-        previous: set[int] = set()
+        deadline = pending.started_at + ALBUM_MAX_WAIT_SECONDS
+        last_snapshot_change = pending.started_at
+        previous: set[int] | None = None
         messages: list[Any] = []
         try:
-            await asyncio.sleep(4)
+            await asyncio.sleep(ALBUM_FIRST_READ_SECONDS)
             if not self.enabled or not self._rules_for_chat(source_id):
                 return
             chat = await event.get_chat()
             if chat is None:
                 chat = await self.client.get_entity(source_id)
-            for attempt in range(3):
-                if attempt:
-                    await asyncio.sleep(2)
+            while self.enabled and self._rules_for_chat(source_id):
+                anchors = pending.anchors.copy()
                 messages = await self._find_album_messages(chat, group_id, anchors)
                 current = {msg.id for msg in messages}
-                if current and anchors <= current and (current == previous or len(current) == 10):
+                now = monotonic()
+                baseline = anchors if previous is None else previous
+                if current != baseline:
+                    last_snapshot_change = now
+                quiet_until = max(last_snapshot_change, pending.last_update_at) + ALBUM_QUIET_SECONDS
+                all_known_visible = bool(current) and pending.anchors <= current
+                if now >= deadline or (all_known_visible and (len(current) == 10 or now >= quiet_until)):
                     break
                 previous = current
+                next_read = quiet_until if all_known_visible else now + ALBUM_FIRST_READ_SECONDS
+                await asyncio.sleep(max(0, min(deadline, next_read) - now))
         except (RPCError, OSError, TimeoutError, ValueError):
             log.warning("[%s] Could not assemble album %s/%s", self.account_name, source_id, group_id, exc_info=True)
             return
         finally:
-            if self._pending_albums.get(key) is anchors:
+            if self._pending_albums.get(key) is pending:
                 self._pending_albums.pop(key, None)
         if not messages:
             log.warning("[%s] No source messages found for album %s/%s", self.account_name, source_id, group_id)
         elif self.enabled:
             log.info("[%s] Assembled album %s/%s: %d items from %d live updates", self.account_name,
-                     source_id, group_id, len(messages), len(anchors))
+                     source_id, group_id, len(messages), len(pending.anchors))
             await self._process_album_messages(chat, source_id, messages)
 
     async def _fetch_channel_comment_batches(
@@ -661,8 +687,8 @@ class AccountRunner:
         lead_id = main_msgs[0].id if history_msg_id is None else history_msg_id
         thread_msg_id = next((m.id for m in main_msgs if getattr(m, "replies", None)), main_msgs[0].id)
         mode = "comments_batch" if rule.comment_merge_mode == "keep_batches" else "comments_pack"
-        group_id = str(getattr(main_msgs[0], "grouped_id", None) or "")
-        main_objects = {id(msg) for msg in main_msgs}
+        album_id = getattr(main_msgs[0], "grouped_id", None)
+        group_id = str(album_id) if album_id is not None else ""
 
         def media_key(msg: Any) -> str:
             return f"{'main' if id(msg) in main_objects else 'reply'}:{msg.id}"
@@ -708,12 +734,22 @@ class AccountRunner:
                     comment_batches, fb_text, fb_entities, latest_ts = await self._fetch_channel_comment_batches(
                         chat, source_id, thread_msg_id
                     )
+                if album_id is not None:
+                    refreshed = await self._find_album_messages(chat, album_id, {msg.id for msg in main_msgs})
+                    if not refreshed:
+                        raise ValueError("源频道相册已不可读")
+                    main_msgs = refreshed
+                    updated_thread = next((msg.id for msg in main_msgs if getattr(msg, "replies", None)), main_msgs[0].id)
+                    if updated_thread != thread_msg_id:
+                        comment_batches, fb_text, fb_entities, _ = await self._fetch_channel_comment_batches(
+                            chat, source_id, updated_thread
+                        )
             else:
                 comment_batches, fb_text, fb_entities, _ = await self._fetch_channel_comment_batches(
                     chat, source_id, thread_msg_id
                 )
 
-        except (RPCError, OSError, TimeoutError) as exc:
+        except (RPCError, OSError, TimeoutError, ValueError) as exc:
             async with self._send_lock:
                 if is_active():
                     for _, target_id, target_title in targets():
@@ -721,11 +757,12 @@ class AccountRunner:
                             account_id=self.account_id, account_name=self.account_name, rule_name=rule.name,
                             source_id=source_id, source_title=source_title, target_id=target_id,
                             target_title=target_title, msg_id=lead_id, item_count=len(main_msgs),
-                            mode=mode, status="error", detail=f"评论读取失败: {exc}",
+                            mode=mode, status="error", detail=f"主帖或评论读取失败: {exc}",
                             delivery_key=delivery_key, rule_id=rule.id, album_group_id=group_id,
                         )
-            return False, f"评论读取失败: {exc}"
+            return False, f"主帖或评论读取失败: {exc}"
 
+        main_objects = {id(msg) for msg in main_msgs}
         main_text_msg = next((m for m in main_msgs if (m.message or "").strip()), None)
         if main_text_msg is not None:
             chosen_text = main_text_msg.message or ""
@@ -817,7 +854,11 @@ class AccountRunner:
                     return False, "清洗后为空文本"
                 return False, "清洗后为空文本，无法发送"
 
-            chunks = build_media_chunks(all_batches, rule.comment_merge_mode, self._media_bucket, max_album=10)
+            if album_id is not None and main_media:
+                chunks = build_media_chunks([main_media], "keep_batches", self._media_bucket)
+                chunks += build_media_chunks(comment_batches, rule.comment_merge_mode, self._media_bucket)
+            else:
+                chunks = build_media_chunks(all_batches, rule.comment_merge_mode, self._media_bucket)
             clean_preview = cleaned_text or (f"[评论区合并 {total_media} 项]" if comment_batches else f"[媒体 {total_media} 项]")
 
             target_list = targets()

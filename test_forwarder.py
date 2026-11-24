@@ -2,6 +2,7 @@ import asyncio
 import logging
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock, patch
@@ -56,6 +57,16 @@ class Audit(unittest.IsolatedAsyncioTestCase):
     def record(self):
         return self.runner.manager.history.record.call_args.kwargs
 
+    @contextmanager
+    def album_clock(self):
+        clock = NS(now=0.0)
+
+        async def advance(seconds):
+            clock.now += seconds
+
+        with patch('forwarder.monotonic', lambda: clock.now, create=True), patch('forwarder.asyncio.sleep', new=advance):
+            yield clock
+
     async def test_album_looks_up_all_media_even_with_only_one_live_update(self):
         runner = self.runner
         settings = rule()
@@ -69,7 +80,7 @@ class Audit(unittest.IsolatedAsyncioTestCase):
         runner.client.get_messages = AsyncMock(return_value=[photos[2], adjacent, *photos[:2], *photos[3:]])
         runner.client.forward_messages.return_value = [post(i) for i in range(30, 35)]
         event = NS(chat_id=SOURCE, message=photos[0], get_chat=AsyncMock(return_value=CHAT))
-        with patch('forwarder.asyncio.sleep', new_callable=AsyncMock):
+        with self.album_clock():
             await runner.process_single(event)
             await asyncio.gather(*runner._bg_tasks)
         runner.client.forward_messages.assert_awaited_once()
@@ -86,12 +97,78 @@ class Audit(unittest.IsolatedAsyncioTestCase):
             photo.grouped_id = 301
         runner.client.get_messages = AsyncMock(return_value=photos[:2])
         runner.client.forward_messages.side_effect = [[post(30), post(31)], [post(32), post(33), post(34)]]
-        with patch('forwarder.asyncio.sleep', new_callable=AsyncMock):
+        with self.album_clock():
             for photo, visible in ((photos[0], photos[:2]), (photos[2], photos)):
                 runner.client.get_messages = AsyncMock(return_value=visible)
                 await runner.process_single(NS(chat_id=SOURCE, message=photo, get_chat=AsyncMock(return_value=CHAT)))
                 await asyncio.gather(*runner._bg_tasks)
         self.assertEqual([call.args[1] for call in runner.client.forward_messages.await_args_list], [[21, 22], [23, 24, 25]])
+
+    async def test_album_waits_for_media_that_appears_ten_seconds_later(self):
+        runner = self.runner
+        runner.source_map = {SOURCE: [rule()]}
+        runner.manager.refresh_if_changed = AsyncMock()
+        photos = [post(i, media=MessageMediaPhoto()) for i in range(21, 26)]
+        for photo in photos:
+            photo.grouped_id = 301
+        runner.client.forward_messages.return_value = [post(i) for i in range(30, 35)]
+        event = NS(chat_id=SOURCE, message=photos[0], get_chat=AsyncMock(return_value=CHAT))
+
+        async def lookup(chat, ids):
+            return photos if clock.now >= 10 else photos[:2]
+
+        with self.album_clock() as clock:
+            runner.client.get_messages = AsyncMock(side_effect=lookup)
+            await runner.process_single(event)
+            await asyncio.gather(*runner._bg_tasks)
+        runner.client.forward_messages.assert_awaited_once()
+        self.assertEqual(runner.client.forward_messages.await_args.args[1], [21, 22, 23, 24, 25])
+
+    async def test_album_wait_is_bounded_when_a_notified_item_is_unreadable(self):
+        runner = self.runner
+        runner.source_map = {SOURCE: [rule()]}
+        runner.manager.refresh_if_changed = AsyncMock()
+        first, missing = (post(i, media=MessageMediaPhoto()) for i in (21, 22))
+        first.grouped_id = missing.grouped_id = 301
+        runner.client.get_messages = AsyncMock(return_value=[first])
+        runner.client.forward_messages.return_value = [post(31)]
+        with self.album_clock() as clock:
+            for photo in (first, missing):
+                await runner.process_single(NS(chat_id=SOURCE, message=photo, get_chat=AsyncMock(return_value=CHAT)))
+            await asyncio.gather(*runner._bg_tasks)
+            self.assertEqual(clock.now, 45)
+        runner.client.forward_messages.assert_awaited_once()
+        self.assertEqual(runner.client.forward_messages.await_args.args[1], [21])
+
+    async def test_comment_pack_preserves_the_original_album(self):
+        runner = self.runner
+        settings = rule(collect_comments=True, comment_merge_mode='pack')
+        photos = [post(i, media=MessageMediaPhoto()) for i in range(21, 26)]
+        for photo in photos:
+            photo.grouped_id = 301
+        reply = post(40, media=MessageMediaPhoto())
+        runner._fetch_channel_comment_batches = AsyncMock(return_value=([[reply]], '', None, 0))
+        runner.client.send_file.side_effect = [[post(i) for i in range(50, 55)], post(56)]
+        with self.album_clock():
+            await self.merged(photos, settings)
+        self.assertEqual([call.args[1] for call in runner.client.send_file.await_args_list],
+                         [[p.media for p in photos], reply.media])
+
+    async def test_comment_wait_refreshes_main_album_before_sending(self):
+        runner = self.runner
+        settings = rule(collect_comments=True)
+        runner.source_map = {SOURCE: [settings]}
+        runner.manager.cfg.rules = [settings]
+        photos = [post(i, media=MessageMediaPhoto()) for i in range(21, 26)]
+        for photo in photos:
+            photo.grouped_id = 301
+        runner.client.get_messages = AsyncMock(return_value=photos)
+        runner.client.send_file.return_value = [post(i) for i in range(30, 35)]
+        with self.album_clock():
+            ok, _ = await runner._process_with_comments(CHAT, SOURCE, 'source', photos[:2], settings)
+        self.assertTrue(ok)
+        runner.client.send_file.assert_awaited_once()
+        self.assertEqual(runner.client.send_file.await_args.args[1], [photo.media for photo in photos])
 
     async def test_late_album_fragment_with_comments_keeps_existing_media(self):
         runner = self.runner

@@ -1106,7 +1106,7 @@
           <div class="field span-full">
             <label>评论区默认媒体分组方式</label>
             <select id="set-comment-mode">
-              <option value="pack" ${(s.comment_merge_mode || 'pack') === 'pack' ? 'selected' : ''}>自动凑满（主帖与评论合并，每组最多 10 项）</option>
+              <option value="pack" ${(s.comment_merge_mode || 'pack') === 'pack' ? 'selected' : ''}>自动凑满（保留主帖原相册，每组最多 10 项）</option>
               <option value="keep_batches" ${s.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>按原批次发送（保持主帖与每条评论各自数量）</option>
             </select>
           </div>
@@ -1456,7 +1456,7 @@
                          <label>媒体分组发送方式（可选覆盖）</label>
                          <select id="rm-comment-mode">
                            <option value="" ${!data.comment_merge_mode ? 'selected' : ''}>跟随全局默认（${(state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批次' : '自动凑满'}）</option>
-                           <option value="pack" ${data.comment_merge_mode === 'pack' ? 'selected' : ''}>单独指定：自动凑满（每组最多 10 项）</option>
+                           <option value="pack" ${data.comment_merge_mode === 'pack' ? 'selected' : ''}>单独指定：自动凑满（保留主帖原相册）</option>
                            <option value="keep_batches" ${data.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>单独指定：按原批次发送</option>
                          </select>
                        </div>
@@ -1625,7 +1625,7 @@
               <li><b>去除全部文本（清空配文，仅发媒体）</b>：清空图片/视频/文件配文只发媒体本身（纯文字贴自动跳过）。<b>注意：仍会先按原配文跑一遍「整条跳过正则」拦截广告图文，再清空文本发送！</b></li>
               <li><b>清洗后为空的纯文本跳过</b>：纯文字广告被正则删空后不发空白消息。</li>
               <li><b>禁用链接网页预览</b>：隐藏消息底部的链接大图摘要卡片。</li>
-              <li><b>抓取评论区频道马甲媒体</b>：开启后主帖发布先异步等待设定窗口，仅抓取评论区里以「频道自身身份」发的图片/视频，支持「自动凑满（每组最多 10 项）」或「按原批次发送」；文字以主帖优先，主帖无字时自动取首条有文字的频道马甲评论。</li>
+              <li><b>抓取评论区频道马甲媒体</b>：开启后等待设定窗口，仅抓取评论区里以「频道自身身份」发的图片或视频。主帖原相册会保留，评论媒体可自动凑组（每组最多 10 项）或按原批次发送。文字优先用主帖，主帖无字时取首条带文字的频道马甲评论。</li>
             </ul>
           </div>
 
