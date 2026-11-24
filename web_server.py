@@ -406,10 +406,11 @@ class WebConsole:
     async def handle_rules_list(self, _request: web.Request) -> web.Response:
         raw = load_raw_config(self.config_path)
         g = raw.get("global") or {}
-        accounts = [{"id": a["id"], "name": a["name"], "enabled": bool(a.get("enabled", True))} for a in (raw.get("accounts") or [])]
+        rules = raw.get("rules") or []
+        accounts = [await self._runner_summary(a, rules) for a in (raw.get("accounts") or [])]
         return web.json_response(
             {
-                "rules": raw.get("rules") or [],
+                "rules": rules,
                 "accounts": accounts,
                 "chat_titles": self.manager.all_chat_titles(),
                 "global_defaults": {

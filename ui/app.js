@@ -218,6 +218,10 @@
       } else if (path === '/log-manage') {
         state.logManage = await api('/api/logs/manage');
       }
+      if (!state.accounts.length && !['/', '/rules', '/chats', '/telegram'].includes(path)) {
+        const accts = await api('/api/accounts');
+        state.accounts = accts.items || [];
+      }
       render();
     } catch (e) {
       toast(e.message, 'danger');
