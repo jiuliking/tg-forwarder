@@ -79,6 +79,10 @@ class CompiledRule:
     id: str = ""
 
 
+DEFAULT_ALBUM_QUIET_SECONDS = 15
+DEFAULT_ALBUM_MAX_WAIT_SECONDS = 45
+
+
 @dataclass
 class AppConfig:
     delay_seconds: float
@@ -89,6 +93,8 @@ class AppConfig:
     rules: list[CompiledRule]
     log_retention_days: int = 30
     log_max_rows: int = 5000
+    album_quiet_seconds: int = DEFAULT_ALBUM_QUIET_SECONDS
+    album_max_wait_seconds: int = DEFAULT_ALBUM_MAX_WAIT_SECONDS
 
 
 REGEX_KINDS = ("skip", "strip_text", "strip", "replace")
@@ -291,7 +297,19 @@ def load_raw_config(config_path: Path) -> dict[str, Any]:
     return raw
 
 
+def parse_album_wait_settings(settings: dict[str, Any]) -> tuple[int, int]:
+    quiet = settings.get("album_quiet_seconds", DEFAULT_ALBUM_QUIET_SECONDS)
+    maximum = settings.get("album_max_wait_seconds", DEFAULT_ALBUM_MAX_WAIT_SECONDS)
+    for value, label in ((quiet, "相册静默等待"), (maximum, "相册最长收集时间")):
+        if type(value) is not int or not 1 <= value <= 300:
+            raise ValueError(f"{label}必须是 1 到 300 秒的整数")
+    if maximum < quiet:
+        raise ValueError("相册最长收集时间必须大于或等于静默等待时间")
+    return quiet, maximum
+
+
 def save_raw_config(config_path: Path, data: dict[str, Any]) -> None:
+    parse_album_wait_settings(data.get("global") or {})
     regex_rules = data.get("regex_rules") or []
     validated_regex = [validate_regex_rule_dict(rx) for rx in regex_rules]
     if "regex_rules" in data or validated_regex:
@@ -325,6 +343,7 @@ def resolve_tg_api(raw: dict[str, Any]) -> tuple[int, str, bool]:
 def load_config(config_path: Path) -> AppConfig:
     raw = load_raw_config(config_path)
     g = raw.get("global") or {}
+    album_quiet, album_max_wait = parse_album_wait_settings(g)
     accounts_out = [
         AccountConfig(
             id=str(a.get("id") or "default").strip(),
@@ -349,6 +368,8 @@ def load_config(config_path: Path) -> AppConfig:
         rules=rules_out,
         log_retention_days=max(0, int(g.get("log_retention_days", 30))),
         log_max_rows=max(100, int(g.get("log_max_rows", 5000))),
+        album_quiet_seconds=album_quiet,
+        album_max_wait_seconds=album_max_wait,
     )
 
 
@@ -733,6 +754,14 @@ class DedupStore:
             )
         """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_parts_ts ON delivery_parts(created_at)")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS source_recovery (
+                account_id TEXT NOT NULL,
+                source_id INTEGER NOT NULL,
+                resume_from INTEGER NOT NULL,
+                PRIMARY KEY (account_id, source_id)
+            )
+        """)
         old_exists = self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='forwarded'"
         ).fetchone()
@@ -775,6 +804,19 @@ class DedupStore:
             key,
         )
         return {row[0] for row in rows}
+
+    def recovery_floors(self, account_id: str) -> dict[int, int]:
+        return dict(self.conn.execute(
+            "SELECT source_id, resume_from FROM source_recovery WHERE account_id=?", (account_id,),
+        ))
+
+    def set_recovery_floors(self, account_id: str, floors: dict[int, int]) -> None:
+        with self.conn:
+            self.conn.executemany(
+                """INSERT INTO source_recovery (account_id, source_id, resume_from) VALUES (?, ?, ?)
+                   ON CONFLICT(account_id, source_id) DO UPDATE SET resume_from=excluded.resume_from""",
+                ((account_id, source_id, resume_from) for source_id, resume_from in floors.items()),
+            )
 
     def mark_delivery_parts(self, key: tuple[str, int, int, int, str], parts: Iterable[str]) -> None:
         now = int(time.time())
@@ -831,7 +873,15 @@ class HistoryStore:
             if column not in cols:
                 self.conn.execute(f"ALTER TABLE history ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_history_source_msg ON history(account_id, source_id, msg_id)")
         self.conn.commit()
+
+    def skipped_rule_names(self, account_id: str, source_id: int, msg_id: int) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT rule_name FROM history WHERE account_id=? AND source_id=? AND msg_id=? AND status='skipped' AND target_id=0",
+            (account_id, source_id, msg_id),
+        )
+        return {row[0] for row in rows}
 
     def record(
         self,

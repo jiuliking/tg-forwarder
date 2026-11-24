@@ -531,6 +531,15 @@ html[data-theme='dark'] .channel-pill.is-target { border-color: rgba(127, 195, 1
 /* Forms & Modals */
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px 16px; }
 .span-full { grid-column: 1 / -1; }
+.settings-form { display: flex; flex-direction: column; gap: 20px; }
+.settings-group { display: flex; flex-direction: column; gap: 14px; }
+.settings-group + .settings-group { padding-top: 20px; border-top: 1px solid var(--line); }
+.settings-group-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; }
+.settings-group-title { font-size: 13px; font-weight: 600; color: var(--text-2); letter-spacing: 0.01em; }
+.settings-group-sub { font-size: 12px; color: var(--text-3); }
+.settings-grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px 18px; align-items: start; }
+.settings-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; align-items: start; }
+.settings-actions { padding-top: 18px; border-top: 1px solid var(--line); }
 .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .field > label { color: var(--text-2); font-size: 13px; font-weight: 500; }
 .field input, .field textarea, .field select {
@@ -764,7 +773,7 @@ html[data-theme='dark'] .picker-item.is-other-selected { border-color: rgba(216,
   .relay-metrics { grid-template-columns: 1fr; gap: 14px; }
   .metrics-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rule-grid, .rx-grid { grid-template-columns: 1fr; }
-  .mapping-cols, .option-grid { grid-template-columns: 1fr; }
+  .mapping-cols, .option-grid, .settings-grid-3, .settings-grid-2 { grid-template-columns: 1fr; }
   .modal-overlay { padding: 10px; }
   .modal-head, .modal-body, .modal-actions { padding-left: 16px; padding-right: 16px; }
   .modal-foot-summary { display: none; }

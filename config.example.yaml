@@ -4,6 +4,8 @@ global:
   dedup_ttl_hours: 48
   log_retention_days: 30
   log_max_rows: 5000
+  album_quiet_seconds: 15       # 同组没有新增媒体的等待时间（秒）
+  album_max_wait_seconds: 45    # 从首项开始计时，必须不小于静默等待时间
   comment_wait_seconds: 30
   comment_merge_mode: pack
   # Optional: override .env Telegram API credentials from Web UI or here

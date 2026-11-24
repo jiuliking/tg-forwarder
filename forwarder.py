@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from aiohttp import web
 from telethon import TelegramClient, events, utils
@@ -67,9 +67,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-forwarder")
 
-ALBUM_QUIET_SECONDS = 15
-ALBUM_MAX_WAIT_SECONDS = 45
 ALBUM_FIRST_READ_SECONDS = 4
+COMMENT_SILENCE_SECONDS = 30
+COMMENT_MAX_EXTRA_SECONDS = 180
+RECOVERY_CHECKPOINT_SECONDS = 30
+RECOVERY_OVERLAP_SECONDS = 120
+RECOVERY_MAX_LOOKBACK_SECONDS = 30 * 60
+RECOVERY_MESSAGE_LIMIT = 200
 
 
 @dataclass
@@ -77,6 +81,21 @@ class PendingAlbum:
     anchors: set[int]
     started_at: float
     last_update_at: float
+    quiet_seconds: int
+    max_wait_seconds: int
+
+
+class ForwarderTelegramClient(TelegramClient):
+    def __init__(self, *args, recovery_callback: Callable[[], None], **kwargs) -> None:
+        self._recovery_callback = recovery_callback
+        super().__init__(*args, **kwargs)
+
+    async def _handle_auto_reconnect(self) -> None:
+        self._recovery_callback()
+        await super()._handle_auto_reconnect()
+
+    def transport_available(self) -> bool:
+        return self.is_connected() and self._sender._transport_connected()
 
 
 class AccountRunner:
@@ -109,9 +128,17 @@ class AccountRunner:
         self._handlers_attached = False
         self.listening = False
         self._listen_task: Optional[asyncio.Task[None]] = None
+        self._recovery_started_at = int(time.time())
+        self._source_activated_at: dict[int, int] = {}
+        self._recovery_task: Optional[asyncio.Task[None]] = None
+        self._checkpoint_task: Optional[asyncio.Task[None]] = None
+        self._recovery_requested_at: int | None = None
+        self._recovery_failed_sources: set[int] = set()
 
     def _build_client(self) -> TelegramClient:
-        client = TelegramClient(str(self.session_prefix), self.api_id, self.api_hash)
+        client = ForwarderTelegramClient(
+            str(self.session_prefix), self.api_id, self.api_hash, recovery_callback=self._request_recovery,
+        )
         client.parse_mode = None
         return client
 
@@ -177,6 +204,7 @@ class AccountRunner:
                     self.listening = self.enabled
                     retry_delay = 2
                     log.info("[%s] Telegram listener reconnected", self.account_name)
+                    self._request_recovery()
                     break
         finally:
             self.listening = False
@@ -263,7 +291,124 @@ class AccountRunner:
             self.listening = self.enabled
             if self.enabled and (self._listen_task is None or self._listen_task.done()):
                 self._listen_task = asyncio.create_task(self._run_listener())
+                self._request_recovery()
+            if self.enabled and (self._checkpoint_task is None or self._checkpoint_task.done()):
+                self._checkpoint_task = asyncio.create_task(self._run_recovery_checkpoints())
+                self._bg_tasks.add(self._checkpoint_task)
+                self._checkpoint_task.add_done_callback(self._bg_tasks.discard)
             log.info("[%s] Listening for updates...", self.account_name)
+
+    def _request_recovery(self) -> None:
+        if not self.enabled or not self.listening:
+            return
+        self._recovery_requested_at = int(time.time())
+        if self._recovery_task is None or self._recovery_task.done():
+            self._recovery_task = asyncio.create_task(self._run_recovery())
+            self._bg_tasks.add(self._recovery_task)
+            self._recovery_task.add_done_callback(self._bg_tasks.discard)
+
+    def _recovery_settle_seconds(self, rules: list[CompiledRule]) -> int:
+        comment_delay = max(
+            (rule.comment_wait_seconds + COMMENT_MAX_EXTRA_SECONDS for rule in rules if rule.collect_comments),
+            default=0,
+        )
+        return self.manager.cfg.album_max_wait_seconds + comment_delay
+
+    def _checkpoint_recovery(self, now: int) -> None:
+        floors = self.manager.dedup.recovery_floors(self.account_id)
+        updates = {}
+        recovering = self._recovery_task is not None and not self._recovery_task.done()
+        for source_id, rules in self.source_map.items():
+            floor = floors.get(source_id)
+            if floor is None:
+                updates[source_id] = now
+            elif not recovering and source_id not in self._recovery_failed_sources:
+                cutoff = now - self._recovery_settle_seconds(rules) - RECOVERY_OVERLAP_SECONDS
+                if cutoff > floor:
+                    updates[source_id] = cutoff
+        if updates:
+            self.manager.dedup.set_recovery_floors(self.account_id, updates)
+
+    async def _run_recovery_checkpoints(self) -> None:
+        while self.enabled:
+            if self.listening and self.client.transport_available():
+                self._checkpoint_recovery(int(time.time()))
+            await asyncio.sleep(RECOVERY_CHECKPOINT_SECONDS)
+
+    async def _run_recovery(self) -> None:
+        while self.enabled and self.listening and self._recovery_requested_at is not None:
+            until = self._recovery_requested_at
+            self._recovery_requested_at = None
+            floors = self.manager.dedup.recovery_floors(self.account_id)
+            sources = sorted(self.source_map, key=lambda source: self._recovery_settle_seconds(self.source_map[source]))
+            activated = getattr(self, "_source_activated_at", {})
+            new_floors = {
+                source_id: activated.get(source_id, self._recovery_started_at)
+                for source_id in sources if source_id not in floors
+            }
+            if new_floors:
+                self.manager.dedup.set_recovery_floors(self.account_id, new_floors)
+                floors.update(new_floors)
+            for source_id in sources:
+                since = max(floors[source_id], until - RECOVERY_MAX_LOOKBACK_SECONDS)
+                if since >= until or source_id not in self.source_map:
+                    continue
+                settle = self._recovery_settle_seconds(self.source_map[source_id])
+                await asyncio.sleep(max(0, until + settle - time.time()))
+                if not self.enabled or not self.listening or not self.client.is_connected():
+                    return
+                try:
+                    await self._recover_source(source_id, since, until)
+                except (RPCError, OSError, TimeoutError, ValueError):
+                    self._recovery_failed_sources.add(source_id)
+                    log.warning("[%s] Could not check missed posts for source %s", self.account_name,
+                                source_id, exc_info=True)
+                else:
+                    self._recovery_failed_sources.discard(source_id)
+
+    async def _recover_source(self, source_id: int, since: int, until: int) -> None:
+        chat = await self.client.get_entity(source_id)
+        batches: dict[tuple[str, int], list[Any]] = {}
+        async for msg in self.client.iter_messages(chat, limit=RECOVERY_MESSAGE_LIMIT):
+            if not getattr(msg, "date", None):
+                continue
+            if msg.date.timestamp() < since - self.manager.cfg.album_max_wait_seconds:
+                break
+            if getattr(msg, "action", None) is not None:
+                continue
+            grouped_id = getattr(msg, "grouped_id", None)
+            key = ("album", grouped_id) if grouped_id is not None else ("single", msg.id)
+            batches.setdefault(key, []).append(msg)
+        else:
+            if sum(len(batch) for batch in batches.values()) >= RECOVERY_MESSAGE_LIMIT:
+                log.warning("[%s] Recovery hit the %d message cap for source %s", self.account_name,
+                            RECOVERY_MESSAGE_LIMIT, source_id)
+        for (kind, group_id), batch in reversed(list(batches.items())):
+            if not self.enabled or not self.listening:
+                return
+            batch.sort(key=lambda msg: msg.id)
+            if batch[0].date.timestamp() > until or batch[-1].date.timestamp() < since:
+                continue
+            if kind == "album" and (source_id, group_id) in self._pending_albums:
+                continue
+            lead_id = batch[0].id
+            skipped = self.manager.history.skipped_rule_names(self.account_id, source_id, lead_id)
+            pending_rules = []
+            for rule in self._rules_for_chat(source_id):
+                if rule.name in skipped:
+                    continue
+                targets = [utils.get_peer_id(self.target_cache[target]) for target in rule.targets
+                           if target in self.target_cache]
+                if any(not self.manager.dedup.seen(source_id, msg.id, target, self.account_id)
+                       for target in targets for msg in batch):
+                    pending_rules.append(rule)
+            if not pending_rules:
+                continue
+            log.info("[%s] Recovering missed post %s/%s (%d items)", self.account_name, source_id, lead_id, len(batch))
+            if kind == "album":
+                await self._process_album_messages(chat, source_id, batch, recovering_rules=pending_rules)
+            else:
+                await self._process_single_message(chat, source_id, batch[0], pending_rules, recovering=True)
 
     @staticmethod
     def _entity_title(ent: Any, fallback: Any) -> str:
@@ -306,6 +451,15 @@ class AccountRunner:
 
         self.source_map = new_source_map
         self.target_cache = new_target_cache
+        activated = getattr(self, "_source_activated_at", None)
+        if activated is None:
+            activated = self._source_activated_at = {}
+        now = int(time.time())
+        for peer_id in new_source_map:
+            activated.setdefault(peer_id, now)
+        for old_id in list(activated):
+            if old_id not in new_source_map:
+                activated.pop(old_id, None)
         log.info(
             "[%s] Loaded %d active sources for account",
             self.account_name,
@@ -581,7 +735,13 @@ class AccountRunner:
                 pending.last_update_at = monotonic()
             return
         now = monotonic()
-        pending = PendingAlbum({event.message.id}, now, now)
+        pending = PendingAlbum(
+            anchors={event.message.id},
+            started_at=now,
+            last_update_at=now,
+            quiet_seconds=self.manager.cfg.album_quiet_seconds,
+            max_wait_seconds=self.manager.cfg.album_max_wait_seconds,
+        )
         self._pending_albums[key] = pending
         task = asyncio.create_task(self._assemble_album(event, key, pending))
         self._bg_tasks.add(task)
@@ -589,12 +749,12 @@ class AccountRunner:
 
     async def _assemble_album(self, event: events.NewMessage.Event, key: tuple[int, int], pending: PendingAlbum) -> None:
         source_id, group_id = key
-        deadline = pending.started_at + ALBUM_MAX_WAIT_SECONDS
+        deadline = pending.started_at + pending.max_wait_seconds
         last_snapshot_change = pending.started_at
         previous: set[int] | None = None
         messages: list[Any] = []
         try:
-            await asyncio.sleep(ALBUM_FIRST_READ_SECONDS)
+            await asyncio.sleep(min(ALBUM_FIRST_READ_SECONDS, pending.quiet_seconds))
             if not self.enabled or not self._rules_for_chat(source_id):
                 return
             chat = await event.get_chat()
@@ -608,7 +768,7 @@ class AccountRunner:
                 baseline = anchors if previous is None else previous
                 if current != baseline:
                     last_snapshot_change = now
-                quiet_until = max(last_snapshot_change, pending.last_update_at) + ALBUM_QUIET_SECONDS
+                quiet_until = max(last_snapshot_change, pending.last_update_at) + pending.quiet_seconds
                 all_known_visible = bool(current) and pending.anchors <= current
                 if now >= deadline or (all_known_visible and (len(current) == 10 or now >= quiet_until)):
                     break
@@ -641,7 +801,7 @@ class AccountRunner:
         latest_ts = 0.0
 
         try:
-            async for cm in self.client.iter_messages(source_ent, reply_to=thread_msg_id, reverse=True, limit=200):
+            async for cm in self.client.iter_messages(source_ent, reply_to=thread_msg_id, reverse=True, limit=400):
                 if cm.id == thread_msg_id:
                     continue
                 if not self._is_channel_sender(cm, source_id):
@@ -677,6 +837,7 @@ class AccountRunner:
         rule: CompiledRule,
         *,
         skip_wait: bool = False,
+        recovering: bool = False,
         target_override: Optional[tuple[Any, int, str]] = None,
         detail_prefix: str = "",
         delivery_key: str = "comments",
@@ -696,7 +857,7 @@ class AccountRunner:
         def is_active() -> bool:
             if not self.enabled:
                 return False
-            if skip_wait:
+            if skip_wait and not recovering:
                 return True
             return rule in self._rules_for_chat(source_id) and rule in self.manager.cfg.rules
 
@@ -718,7 +879,7 @@ class AccountRunner:
             if not skip_wait:
                 wait_s = max(5, rule.comment_wait_seconds)
                 start_ts = time.time()
-                max_deadline = start_ts + wait_s + 60.0
+                max_deadline = start_ts + wait_s + COMMENT_MAX_EXTRA_SECONDS
 
                 await asyncio.sleep(wait_s)
                 if not is_active():
@@ -727,7 +888,7 @@ class AccountRunner:
                 comment_batches, fb_text, fb_entities, latest_ts = await self._fetch_channel_comment_batches(
                     chat, source_id, thread_msg_id
                 )
-                while latest_ts > 0 and (time.time() - latest_ts) < 10.0 and time.time() < max_deadline:
+                while latest_ts > 0 and (time.time() - latest_ts) < COMMENT_SILENCE_SECONDS and time.time() < max_deadline:
                     await asyncio.sleep(5)
                     if not is_active():
                         return False, "规则已停用或修改"
@@ -1479,6 +1640,11 @@ class AccountRunner:
             return
 
         chat = await event.get_chat()
+        await self._process_single_message(chat, source_id, msg, rules)
+
+    async def _process_single_message(
+        self, chat: Any, source_id: int, msg: Any, rules: list[CompiledRule], *, recovering: bool = False,
+    ) -> None:
         source_title = self._entity_title(chat, source_id)
         self.chat_titles[source_id] = source_title
         raw_text = msg.message or ""
@@ -1489,7 +1655,11 @@ class AccountRunner:
         comment_rules = [r for r in rules if r.collect_comments and is_broadcast]
         normal_rules = [r for r in rules if not (r.collect_comments and is_broadcast)]
         for rule in comment_rules:
-            self._schedule_comment_forward(chat, source_id, source_title, [msg], rule)
+            if recovering:
+                await self._process_with_comments(chat, source_id, source_title, [msg], rule,
+                                                  skip_wait=True, recovering=True, detail_prefix="回查补发")
+            else:
+                self._schedule_comment_forward(chat, source_id, source_title, [msg], rule)
         if not normal_rules:
             return
 
@@ -1588,8 +1758,10 @@ class AccountRunner:
                     if self.manager.cfg.delay_seconds > 0:
                         await asyncio.sleep(self.manager.cfg.delay_seconds)
 
-    async def _process_album_messages(self, chat: Any, source_id: int, msgs: list[Any]) -> None:
-        rules = self._rules_for_chat(source_id)
+    async def _process_album_messages(
+        self, chat: Any, source_id: int, msgs: list[Any], *, recovering_rules: list[CompiledRule] | None = None,
+    ) -> None:
+        rules = self._rules_for_chat(source_id) if recovering_rules is None else recovering_rules
         if not rules:
             return
 
@@ -1602,7 +1774,11 @@ class AccountRunner:
         comment_rules = [r for r in rules if r.collect_comments and is_broadcast]
         normal_rules = [r for r in rules if not (r.collect_comments and is_broadcast)]
         for rule in comment_rules:
-            self._schedule_comment_forward(chat, source_id, source_title, msgs, rule)
+            if recovering_rules is not None:
+                await self._process_with_comments(chat, source_id, source_title, msgs, rule,
+                                                  skip_wait=True, recovering=True, detail_prefix="回查补发")
+            else:
+                self._schedule_comment_forward(chat, source_id, source_title, msgs, rule)
         if not normal_rules:
             return
 

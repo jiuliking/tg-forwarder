@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from aiohttp.test_utils import TestClient, TestServer
 from telethon.errors import AuthKeyUnregisteredError, RPCError
 from telethon.tl.types import InputPeerChannel, MessageMediaPhoto
-from common import AuthStore, DedupStore, HistoryStore, compile_rule_dict, load_raw_config
+from common import AuthStore, DedupStore, HistoryStore, compile_rule_dict, load_config, load_raw_config
 from forwarder import AccountRunner
 from web_server import WebConsole
 
@@ -47,8 +47,10 @@ class Audit(unittest.IsolatedAsyncioTestCase):
         runner.chat_titles = {}
         runner.target_cache = {TARGET: TARGET_PEER}
         runner.source_map = {}
-        runner.manager = NS(cfg=NS(delay_seconds=0, max_download_mb=100, temp_dir=self.tmp),
-                            dedup=DedupStore(self.tmp / 'db'), history=NS(record=Mock()))
+        runner._source_activated_at = {}
+        runner.manager = NS(cfg=NS(delay_seconds=0, max_download_mb=100, temp_dir=self.tmp,
+                                   album_quiet_seconds=15, album_max_wait_seconds=45),
+                            dedup=DedupStore(self.tmp / 'db'), history=NS(record=Mock(), skipped_rule_names=Mock(return_value=set())))
         self.addCleanup(runner.manager.dedup.conn.close)
         runner.client = NS(send_file=AsyncMock(), send_message=AsyncMock(), forward_messages=AsyncMock(),
                            run_until_disconnected=AsyncMock(), disconnect=AsyncMock(), _authorized=True)
@@ -56,6 +58,167 @@ class Audit(unittest.IsolatedAsyncioTestCase):
 
     def record(self):
         return self.runner.manager.history.record.call_args.kwargs
+
+    async def test_album_settings_round_trip_and_reject_invalid_patch(self):
+        cfg = self.tmp / 'config.yaml'
+        auth = AuthStore(self.tmp / 'auth.db')
+        self.addCleanup(auth.conn.close)
+
+        async def reload_config(*, force):
+            self.runner.manager.cfg = load_config(cfg)
+
+        self.runner.manager.reload_all = AsyncMock(side_effect=reload_config)
+        console = WebConsole(self.runner.manager, auth, cfg, self.tmp, Path(__file__).parent / 'ui')
+        headers = {'Authorization': 'Bearer ' + auth.get_access_token()}
+        async with TestClient(TestServer(console.build_app())) as client:
+            async with client.get('/api/settings', headers=headers) as response:
+                body = await response.json()
+                self.assertEqual((body.get('album_quiet_seconds'), body.get('album_max_wait_seconds')), (15, 45))
+            async with client.put('/api/settings', headers=headers,
+                                  json={'album_quiet_seconds': 25, 'album_max_wait_seconds': 65}) as response:
+                self.assertEqual(response.status, 200)
+            self.assertEqual(self.runner.manager.cfg.album_quiet_seconds, 25)
+            self.assertEqual(self.runner.manager.cfg.album_max_wait_seconds, 65)
+            saved = cfg.read_bytes()
+            for invalid in ({'album_max_wait_seconds': 20}, {'album_quiet_seconds': 1.5},
+                            {'album_quiet_seconds': True}, {'album_max_wait_seconds': 301}):
+                async with client.put('/api/settings', headers=headers, json=invalid) as response:
+                    self.assertEqual(response.status, 400)
+                self.assertEqual(cfg.read_bytes(), saved)
+            async with client.get('/api/settings', headers=headers) as response:
+                body = await response.json()
+                self.assertEqual((body['album_quiet_seconds'], body['album_max_wait_seconds']), (25, 65))
+        self.runner.manager.reload_all.assert_awaited_once_with(force=True)
+
+    async def test_new_album_uses_the_global_wait_values(self):
+        runner = self.runner
+        runner.manager.cfg.album_quiet_seconds = 22
+        runner.manager.cfg.album_max_wait_seconds = 61
+        runner.source_map = {SOURCE: [rule()]}
+        runner.manager.refresh_if_changed = AsyncMock()
+        photo = post(21, media=MessageMediaPhoto())
+        photo.grouped_id = 301
+        runner.client.get_messages = AsyncMock(return_value=[photo])
+        runner.client.forward_messages.return_value = [post(31)]
+        with self.album_clock() as clock:
+            await runner.process_single(NS(chat_id=SOURCE, message=photo, get_chat=AsyncMock(return_value=CHAT)))
+            await asyncio.gather(*runner._bg_tasks)
+            self.assertEqual(clock.now, 22)
+        runner.client.forward_messages.assert_awaited_once()
+
+    async def test_restart_recovers_missed_albums_in_order_without_replaying_delivered_items(self):
+        from datetime import datetime, timezone
+
+        runner = self.runner
+        runner.source_map = {SOURCE: [rule()]}
+        runner.client.get_entity = AsyncMock(return_value=CHAT)
+        photos = [post(i, media=MessageMediaPhoto()) for i in range(21, 27)]
+        for photo, group in zip(photos, [301, 301, 302, 302, 303, 303]):
+            photo.grouped_id = group
+            photo.date = datetime.fromtimestamp(1000, timezone.utc)
+
+        async def history(*args, **kwargs):
+            for photo in reversed(photos):
+                yield photo
+
+        runner.client.iter_messages = history
+        runner.manager.dedup.mark_many(SOURCE, [21, 22], TARGET)
+        runner.client.forward_messages.side_effect = [[post(40), post(41)], [post(42), post(43)]]
+        await runner._recover_source(SOURCE, 999, 1001)
+        self.assertEqual([call.args[1] for call in runner.client.forward_messages.await_args_list], [[23, 24], [25, 26]])
+
+    async def test_recovery_uses_the_checkpoint_saved_before_restart(self):
+        runner = self.runner
+        runner.source_map = {SOURCE: [rule()]}
+        runner._recovery_started_at = 2000
+        runner.manager.dedup.set_recovery_floors(runner.account_id, {SOURCE: 1800})
+        runner.manager.dedup.conn.close()
+        runner.manager.dedup = DedupStore(self.tmp / 'db')
+        self.addCleanup(runner.manager.dedup.conn.close)
+        runner.client.is_connected = Mock(return_value=True)
+        runner._recover_source = AsyncMock()
+
+        runner._recovery_requested_at = 2000
+        runner._recovery_failed_sources = set()
+        with patch('forwarder.time.time', return_value=2100), patch('forwarder.asyncio.sleep', new_callable=AsyncMock):
+            await runner._run_recovery()
+            await runner._run_recovery()
+        runner._recover_source.assert_awaited_once_with(SOURCE, 1800, 2000)
+        self.assertIsNone(runner._recovery_requested_at)
+
+    async def test_healthy_checkpoint_ticks_do_not_query_telegram(self):
+        runner = self.runner
+        runner.source_map = {SOURCE: [rule()]}
+        runner._recovery_task = None
+        runner._recovery_failed_sources = set()
+        runner.client.transport_available = Mock(return_value=True)
+        runner.client.get_entity = AsyncMock()
+        runner._recover_source = AsyncMock()
+        runner.manager.dedup.set_recovery_floors(runner.account_id, {SOURCE: 1000})
+        ticks = 0
+
+        async def stop_after_three_ticks(_delay):
+            nonlocal ticks
+            ticks += 1
+            if ticks == 3:
+                runner.enabled = False
+
+        with patch('forwarder.time.time', side_effect=[2000, 2030, 2060]), patch('forwarder.asyncio.sleep', new=stop_after_three_ticks):
+            await runner._run_recovery_checkpoints()
+        runner.client.get_entity.assert_not_awaited()
+        runner._recover_source.assert_not_awaited()
+        self.assertEqual(runner.manager.dedup.recovery_floors(runner.account_id), {SOURCE: 1895})
+
+    async def test_comments_wait_through_20s_batch_gaps_and_extend_past_60s(self):
+        runner = self.runner
+        settings = rule(collect_comments=True, comment_wait_seconds=60, comment_merge_mode='keep_batches')
+        runner.source_map = {SOURCE: [settings]}
+        runner.manager.cfg.rules = [settings]
+        main_photo = post(10, media=MessageMediaPhoto(), text='main')
+        main_photo.grouped_id = 500
+        batch1 = [post(101, media=MessageMediaPhoto()), post(102, media=MessageMediaPhoto())]
+        for item in batch1:
+            item.grouped_id = 601
+        batch2 = [post(103, media=MessageMediaPhoto()), post(104, media=MessageMediaPhoto())]
+        for item in batch2:
+            item.grouped_id = 602
+        runner._find_album_messages = AsyncMock(return_value=[main_photo])
+        runner.client.send_file.side_effect = [post(201), [post(202), post(203)], [post(204), post(205)]]
+
+        now = 1000.0
+        async def advance(seconds):
+            nonlocal now
+            now += seconds
+
+        async def fetch(_ent, _sid, _tid):
+            if now < 1072.0:
+                return [batch1], '', None, 1049.0  # 11s old at wake-up (1060), 23s gap before batch2
+            return [batch1, batch2], '', None, 1072.0
+
+        runner._fetch_channel_comment_batches = AsyncMock(side_effect=fetch)
+        with patch('forwarder.time.time', lambda: now), patch('forwarder.asyncio.sleep', new=advance):
+            ok, mode = await runner._process_with_comments(CHAT, SOURCE, 'Source', [main_photo], settings)
+        self.assertTrue(ok)
+        self.assertEqual(mode, 'comments_batch')
+        self.assertEqual(runner.client.send_file.await_count, 3)
+        self.assertGreaterEqual(now, 1102.0)
+
+    async def test_new_source_added_later_seeds_activation_time_not_process_boot_time(self):
+        runner = self.runner
+        runner._recovery_started_at = 1000
+        runner.client.get_entity = AsyncMock(side_effect=[InputPeerChannel(11, 1), TARGET_PEER])
+        runner.client.get_input_entity = AsyncMock(return_value=TARGET_PEER)
+        runner.client.is_connected = Mock(return_value=True)
+        runner._recover_source = AsyncMock()
+        runner.ensure_authorized = AsyncMock(return_value=True)
+        cfg = NS(rules=[rule()])
+        with patch('forwarder.time.time', return_value=2000):
+            await runner.refresh_routes(cfg)
+        runner._recovery_requested_at = 2000
+        with patch('forwarder.time.time', return_value=2000), patch('forwarder.asyncio.sleep', new_callable=AsyncMock):
+            await runner._run_recovery()
+        self.assertEqual(runner.manager.dedup.recovery_floors(runner.account_id), {SOURCE: 2000})
+        runner._recover_source.assert_not_awaited()
 
     @contextmanager
     def album_clock(self):
@@ -317,6 +480,7 @@ class Audit(unittest.IsolatedAsyncioTestCase):
         r = self.runner
         r.ensure_authorized = AsyncMock(return_value=True)
         r.refresh_routes = AsyncMock()
+        r._request_recovery = Mock()
 
         async def listen():
             if r.client.run_until_disconnected.await_count == 1:
@@ -329,6 +493,7 @@ class Audit(unittest.IsolatedAsyncioTestCase):
             await r._run_listener()
         self.assertEqual(r.client.run_until_disconnected.await_count, 2)
         r.refresh_routes.assert_awaited_once()
+        r._request_recovery.assert_called_once_with()
 
     async def test_revoked_after_chats_auth_returns_a_user_facing_status(self):
         r = self.runner

@@ -1077,57 +1077,95 @@
       <div class="page-head">
         <div>
           <h1>全局设置</h1>
-          <p class="page-sub">控制转发限速、受限下载上限、去重周期与面板访问 Token</p>
+          <p class="page-sub">设置转发间隔、相册与评论收集时间、去重周期和面板访问 Token</p>
         </div>
       </div>
 
       <section class="panel">
         <div class="panel-head"><h2 class="panel-title">运行参数</h2></div>
-        <form id="settings-form" class="form-grid">
-          <div class="field">
-            <label>转发间隔（秒）</label>
-            <input id="set-delay" type="number" step="0.1" min="0" value="${esc(s.delay_seconds)}" />
-            <span class="hint">每次发帖后停顿时间，建议 ≥ 1.0 防止 TG 限流</span>
+        <form id="settings-form" class="settings-form">
+          <div class="settings-group">
+            <div class="settings-group-head">
+              <span class="settings-group-title">基础转发与去重</span>
+              <span class="settings-group-sub">控制全局限速、受限频道兜底体积与消息去重窗口</span>
+            </div>
+            <div class="settings-grid-3">
+              <div class="field">
+                <label for="set-delay">转发间隔（秒）</label>
+                <input id="set-delay" type="number" step="0.1" min="0" required value="${esc(s.delay_seconds)}" />
+                <span class="hint">每次发帖后停顿时间，建议 ≥ 1.0 防止 TG 限流</span>
+              </div>
+              <div class="field">
+                <label for="set-maxmb">受限频道单次下载上限（MB）</label>
+                <input id="set-maxmb" type="number" min="1" step="1" required value="${esc(s.max_download_mb)}" />
+                <span class="hint">仅针对禁止转发频道的兜底重传生效</span>
+              </div>
+              <div class="field">
+                <label for="set-ttl">消息去重保留时长（小时）</label>
+                <input id="set-ttl" type="number" min="1" step="1" required value="${esc(s.dedup_ttl_hours)}" />
+                <span class="hint">已转发记录在此时长内不重复处理，过期后自动清理</span>
+              </div>
+            </div>
           </div>
-          <div class="field">
-            <label>受限频道单次下载上限（MB）</label>
-            <input id="set-maxmb" type="number" min="1" value="${esc(s.max_download_mb)}" />
-            <span class="hint">仅针对禁止转发频道的兜底重传生效</span>
+
+          <div class="settings-group">
+            <div class="settings-group-head">
+              <span class="settings-group-title">相册收集</span>
+              <span class="settings-group-sub">控制多图/多视频相册分批到达时的聚合等待时间</span>
+            </div>
+            <div class="settings-grid-2">
+              <div class="field">
+                <label for="set-album-quiet">相册静默等待（秒）</label>
+                <input id="set-album-quiet" type="number" min="1" max="300" step="1" required value="${esc(s.album_quiet_seconds ?? 15)}" />
+                <span class="hint">同组没有新增媒体达到此时长后发出，新增媒体会重新计时</span>
+              </div>
+              <div class="field">
+                <label for="set-album-max-wait">相册最长收集时间（秒）</label>
+                <input id="set-album-max-wait" type="number" min="1" max="300" step="1" required value="${esc(s.album_max_wait_seconds ?? 45)}" />
+                <span class="hint">从第一项开始计时，必须大于或等于静默等待时间；凑满 10 项可提前发送</span>
+              </div>
+            </div>
           </div>
-          <div class="field">
-            <label>消息去重保留时长（小时）</label>
-            <input id="set-ttl" type="number" min="1" value="${esc(s.dedup_ttl_hours)}" />
+
+          <div class="settings-group">
+            <div class="settings-group-head">
+              <span class="settings-group-title">评论区默认参数</span>
+              <span class="settings-group-sub">规则开启「抓取评论区」且未单独覆盖时默认使用</span>
+            </div>
+            <div class="settings-grid-2">
+              <div class="field">
+                <label for="set-comment-wait">评论区默认等待收集窗口（秒）</label>
+                <input id="set-comment-wait" type="number" min="5" max="300" step="1" required value="${esc(s.comment_wait_seconds ?? 30)}" />
+                <span class="hint">作者仍在继续传图时会自动顺延等待</span>
+              </div>
+              <div class="field">
+                <label for="set-comment-mode">评论区默认媒体分组方式</label>
+                <select id="set-comment-mode">
+                  <option value="pack" ${(s.comment_merge_mode || 'pack') === 'pack' ? 'selected' : ''}>自动凑满（保留主帖原相册，每组最多 10 项）</option>
+                  <option value="keep_batches" ${s.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>按原批次发送（保持主帖与每条评论各自数量）</option>
+                </select>
+                <span class="hint">决定主帖与作者评论媒体合并时的相册拆分方式</span>
+              </div>
+            </div>
           </div>
-          <div class="field">
-            <label>评论区默认等待收集窗口（秒）</label>
-            <input id="set-comment-wait" type="number" min="5" max="300" value="${esc(s.comment_wait_seconds ?? 30)}" />
-            <span class="hint">规则启用「抓取评论区」且未单独覆盖时使用；作者仍在继续传图会自动顺延</span>
-          </div>
-          <div class="field span-full">
-            <label>评论区默认媒体分组方式</label>
-            <select id="set-comment-mode">
-              <option value="pack" ${(s.comment_merge_mode || 'pack') === 'pack' ? 'selected' : ''}>自动凑满（保留主帖原相册，每组最多 10 项）</option>
-              <option value="keep_batches" ${s.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>按原批次发送（保持主帖与每条评论各自数量）</option>
-            </select>
-          </div>
-          <div class="span-full actions">
+
+          <div class="actions settings-actions">
             <button class="btn primary" type="submit">保存设置</button>
           </div>
         </form>
       </section>
 
       <section class="panel">
-        <div class="panel-head">
-          <h2 class="panel-title">Telegram API 凭据（MTProto）</h2>
+        <div class="panel-head"><h2 class="panel-title">Telegram API 凭据（MTProto）</h2>
           <span class="badge ${s.api_custom ? 'info' : 'muted'}">${s.api_custom ? '自定义凭据' : '系统默认 (.env)'}</span>
         </div>
-        <form id="api-settings-form" class="form-grid">
+        <form id="api-settings-form" class="settings-grid-2">
           <div class="field">
-            <label>API ID</label>
+            <label for="set-api-id">API ID</label>
             <input id="set-api-id" type="number" min="1" class="mono" value="${esc(s.api_id || '')}" required />
           </div>
           <div class="field">
-            <label>API Hash</label>
+            <label for="set-api-hash">API Hash</label>
             <input id="set-api-hash" type="password" class="mono" placeholder="${s.api_hash_masked ? '已配置 (' + esc(s.api_hash_masked) + ')，不改请留空' : '输入 API Hash'}" />
           </div>
           <div class="span-full hint">
@@ -2818,17 +2856,37 @@
     if (settingsForm) {
       settingsForm.onsubmit = async (e) => {
         e.preventDefault();
+        const payload = {
+          delay_seconds: Number(document.getElementById('set-delay').value),
+          max_download_mb: Number(document.getElementById('set-maxmb').value),
+          dedup_ttl_hours: Number(document.getElementById('set-ttl').value),
+          album_quiet_seconds: Number(document.getElementById('set-album-quiet').value),
+          album_max_wait_seconds: Number(document.getElementById('set-album-max-wait').value),
+          comment_wait_seconds: Number(document.getElementById('set-comment-wait').value),
+          comment_merge_mode: document.getElementById('set-comment-mode').value,
+        };
+        if (!Number.isInteger(payload.album_quiet_seconds) || payload.album_quiet_seconds < 1 || payload.album_quiet_seconds > 300) {
+          toast('相册静默等待必须是 1 到 300 秒的整数', 'danger');
+          return;
+        }
+        if (!Number.isInteger(payload.album_max_wait_seconds) || payload.album_max_wait_seconds < 1 || payload.album_max_wait_seconds > 300) {
+          toast('相册最长收集时间必须是 1 到 300 秒的整数', 'danger');
+          return;
+        }
+        if (payload.album_max_wait_seconds < payload.album_quiet_seconds) {
+          toast('相册最长收集时间必须大于或等于静默等待时间', 'danger');
+          return;
+        }
         try {
           await api('/api/settings', {
             method: 'PUT',
-            body: JSON.stringify({
-              delay_seconds: Number(document.getElementById('set-delay').value),
-              max_download_mb: Number(document.getElementById('set-maxmb').value),
-              dedup_ttl_hours: Number(document.getElementById('set-ttl').value),
-              comment_wait_seconds: Number(document.getElementById('set-comment-wait').value),
-              comment_merge_mode: document.getElementById('set-comment-mode').value,
-            }),
+            body: JSON.stringify(payload),
           });
+          if (state.settings) Object.assign(state.settings, payload);
+          state.ruleGlobalDefaults = {
+            comment_wait_seconds: payload.comment_wait_seconds,
+            comment_merge_mode: payload.comment_merge_mode,
+          };
           toast('设置已保存并热生效', 'success');
         } catch (err) {
           toast(err.message, 'danger');

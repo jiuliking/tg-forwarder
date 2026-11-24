@@ -19,6 +19,7 @@ from common import (
     clean_message_text,
     compile_rule_dict,
     load_raw_config,
+    parse_album_wait_settings,
     resolve_rule_patterns,
     resolve_tg_api,
     save_raw_config,
@@ -757,6 +758,7 @@ class WebConsole:
     async def handle_settings_get(self, _request: web.Request) -> web.Response:
         raw = load_raw_config(self.config_path)
         g = raw.get("global") or {}
+        album_quiet, album_max_wait = parse_album_wait_settings(g)
         api_id, api_hash, is_custom = resolve_tg_api(raw)
         masked_hash = (
             (api_hash[:4] + "****" + api_hash[-4:])
@@ -768,6 +770,8 @@ class WebConsole:
                 "delay_seconds": float(g.get("delay_seconds", 1.0)),
                 "max_download_mb": int(g.get("max_download_mb", 2000)),
                 "dedup_ttl_hours": int(g.get("dedup_ttl_hours", 48)),
+                "album_quiet_seconds": album_quiet,
+                "album_max_wait_seconds": album_max_wait,
                 "comment_wait_seconds": max(5, min(300, int(g.get("comment_wait_seconds", 30) or 30))),
                 "comment_merge_mode": (
                     "keep_batches" if str(g.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
@@ -794,6 +798,14 @@ class WebConsole:
         async with self._config_lock:
             raw = load_raw_config(self.config_path)
             g = raw.setdefault("global", {})
+
+            for key in ("album_quiet_seconds", "album_max_wait_seconds"):
+                if key in data:
+                    g[key] = data[key]
+            try:
+                parse_album_wait_settings(g)
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
 
             if delay_val is not None:
                 g["delay_seconds"] = delay_val
