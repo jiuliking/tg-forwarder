@@ -1,7 +1,20 @@
+import asyncio
+import os
+import stat
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
-from telethon.tl.types import MessageEntityBold, MessageEntityTextUrl
+from telethon.tl.types import (
+    DocumentAttributeAnimated,
+    DocumentAttributeAudio,
+    DocumentAttributeSticker,
+    DocumentAttributeVideo,
+    MessageEntityBold,
+    MessageEntityTextUrl,
+    MessageMediaDocument,
+    MessageMediaPhoto,
+)
 
 from common import (
     AuthStore,
@@ -14,7 +27,10 @@ from common import (
     save_raw_config,
     should_skip_text,
     should_strip_all_text,
+    truncate_text_with_entities,
+    utf16_len,
 )
+from forwarder import AccountRunner
 
 
 def test_clean_preserves_utf16_entities() -> None:
@@ -87,10 +103,131 @@ def test_unchanged_text_returns_false() -> None:
         p = Path(td) / "cfg.yaml"
         p.write_text("rules:\n  - name: t2\n    sources: [-1001]\n    targets: [-1002]\n    strip_patterns: ['广告']\n", encoding="utf-8")
         rule = load_config(p).rules[0]
-        cleaned, ents, changed = clean_message_text("正常内容", [MessageEntityBold(offset=0, length=2)], rule)
+        cleaned, ents, changed = clean_message_text("正常内容\n\n\n保留空行", [MessageEntityBold(offset=0, length=2)], rule)
         assert changed is False
-        assert cleaned == "正常内容"
+        assert cleaned == "正常内容\n\n\n保留空行"
         assert len(ents) == 1
+
+
+def test_invalid_replace_template_rejected() -> None:
+    try:
+        compile_rule_dict(
+            {
+                "name": "bad_repl",
+                "replace_patterns": [{"pattern": "foo", "repl": r"\1"}],
+            }
+        )
+        raise AssertionError("Expected ValueError for invalid backreference")
+    except ValueError:
+        pass
+
+
+def test_truncate_text_with_entities_utf16() -> None:
+    text = "🔥" * 10 + "你好世界ABCDEF"
+    ent_keep = MessageEntityBold(offset=0, length=4)
+    ent_clip = MessageEntityBold(offset=18, length=6)
+    ent_drop = MessageEntityBold(offset=25, length=3)
+    out, ents = truncate_text_with_entities(text, [ent_keep, ent_clip, ent_drop], max_utf16=22)
+    assert utf16_len(out) <= 22
+    assert out.endswith("…")
+    assert ents is not None and len(ents) == 2
+    assert ents[0].offset == 0 and ents[0].length == 4
+    assert ents[1].offset == 18 and ents[1].offset + ents[1].length <= utf16_len(out) - 1
+
+
+def test_media_bucket_classification() -> None:
+    def _doc_msg(mime: str, attrs: list):
+        return SimpleNamespace(media=MessageMediaDocument(document=SimpleNamespace(mime_type=mime, attributes=attrs)))
+
+    photo_msg = SimpleNamespace(media=MessageMediaPhoto())
+    assert AccountRunner._media_bucket(photo_msg) == "pv"
+    assert AccountRunner._media_bucket(_doc_msg("video/mp4", [DocumentAttributeVideo(duration=5, w=720, h=1280)])) == "pv"
+    assert AccountRunner._media_bucket(_doc_msg("video/mp4", [DocumentAttributeVideo(duration=5, w=240, h=240, round_message=True)])) == "single"
+    assert AccountRunner._media_bucket(_doc_msg("video/mp4", [DocumentAttributeVideo(duration=3, w=320, h=240), DocumentAttributeAnimated()])) == "single"
+    assert AccountRunner._media_bucket(_doc_msg("image/webp", [DocumentAttributeSticker(alt="😀", stickerset=None)])) == "single"
+    assert AccountRunner._media_bucket(_doc_msg("video/webm", [DocumentAttributeSticker(alt="😀", stickerset=None), DocumentAttributeVideo(duration=2, w=512, h=512)])) == "single"
+    assert AccountRunner._media_bucket(_doc_msg("audio/ogg", [DocumentAttributeAudio(duration=4, voice=True)])) == "single"
+    assert AccountRunner._media_bucket(_doc_msg("audio/mpeg", [DocumentAttributeAudio(duration=180, voice=False)])) == "audio"
+    assert AccountRunner._media_bucket(_doc_msg("application/pdf", [])) == "doc"
+
+
+def test_auth_change_password_revokes_other_sessions_and_chmod_600() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "state.db"
+        auth = AuthStore(db_path)
+        mode = stat.S_IMODE(os.stat(db_path).st_mode)
+        assert mode == 0o600, f"Expected 0600, got {oct(mode)}"
+        s1 = auth.create_session()
+        s2 = auth.create_session()
+        assert auth.verify_session(s1) and auth.verify_session(s2)
+        assert auth.change_password(auth.generated_password, "newpass456", keep_session=s1) is True
+        assert auth.verify_session(s1) is True
+        assert auth.verify_session(s2) is False
+
+
+def test_phone_2fa_does_not_resubmit_otp() -> None:
+    from telethon.errors import SessionPasswordNeededError
+    from web_server import WebConsole
+
+    calls = []
+
+    class FakeClient:
+        def is_connected(self):
+            return True
+
+        async def connect(self):
+            pass
+
+        async def send_code_request(self, phone):
+            return SimpleNamespace(phone_code_hash="hash123")
+
+        async def sign_in(self, **kwargs):
+            calls.append(kwargs)
+            if "phone" in kwargs:
+                raise SessionPasswordNeededError(request=None)
+            assert kwargs == {"password": "my-fixed-2fa-password"}
+
+    class FakeRunner:
+        enabled = True
+        client = FakeClient()
+        session_file = Path("/tmp/nonexistent_tgfwd_test.session")
+        authorized_called = False
+
+        async def on_user_authorized(self):
+            self.authorized_called = True
+
+    class FakeManager:
+        runner = FakeRunner()
+
+        def get_runner(self, acct_id):
+            return self.runner
+
+    class FakeRequest:
+        def __init__(self, payload):
+            self._payload = payload
+            self.can_read_body = True
+
+        async def json(self):
+            return self._payload
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            console = WebConsole(FakeManager(), AuthStore(p / "s.db"), p / "c.yaml", p, p)
+            r0 = await console.handle_tg_phone_send(FakeRequest({"account_id": "default", "phone": "+1234567890"}))
+            assert r0.status == 200
+            r1 = await console.handle_tg_phone_verify(FakeRequest({"account_id": "default", "code": "12345"}))
+            assert r1.status == 200 and '"need_2fa": true' in r1.text
+            r2 = await console.handle_tg_phone_verify(
+                FakeRequest({"account_id": "default", "code": "12345", "password": "my-fixed-2fa-password"})
+            )
+            assert r2.status == 200 and '"authorized"' in r2.text
+            assert len(calls) == 2
+            assert "phone" in calls[0] and "password" not in calls[0]
+            assert calls[1] == {"password": "my-fixed-2fa-password"}
+            assert console.manager.runner.authorized_called is True
+
+    asyncio.run(_run())
 
 
 def test_stores_and_config_roundtrip() -> None:
@@ -215,6 +352,11 @@ if __name__ == "__main__":
     test_clean_preserves_utf16_entities()
     test_strip_all_text_still_runs_skip_filter()
     test_unchanged_text_returns_false()
+    test_invalid_replace_template_rejected()
+    test_truncate_text_with_entities_utf16()
+    test_media_bucket_classification()
+    test_auth_change_password_revokes_other_sessions_and_chmod_600()
+    test_phone_2fa_does_not_resubmit_otp()
     test_stores_and_config_roundtrip()
     test_history_pagination()
     print("ALL TESTS PASSED")

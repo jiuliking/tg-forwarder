@@ -19,6 +19,7 @@
     qrPollTimer: null,
     phoneStep: 'input',
     phoneNum: '',
+    phoneCode: '',
     settings: null,
     ruleGlobalDefaults: { comment_wait_seconds: 30, comment_merge_mode: 'pack' },
     logManage: null,
@@ -64,6 +65,28 @@
     el.textContent = msg;
     stack.appendChild(el);
     setTimeout(() => el.remove(), 3400);
+  }
+
+  async function copyText(text, successMsg = '已复制到剪贴板') {
+    const val = String(text ?? '');
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(val);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = val;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        ta.remove();
+        if (!ok) throw new Error('浏览器拒绝复制');
+      }
+      toast(successMsg, 'success');
+    } catch (err) {
+      toast('复制失败：' + (err?.message || '请手动复制'), 'danger');
+    }
   }
 
   async function api(path, opts = {}) {
@@ -578,7 +601,7 @@
               </div>
 
               <div class="hint">
-                跳过正则 ${(r.skip_patterns || []).length} 条 · 去除正则 ${(r.strip_patterns || []).length} 条 · 替换 ${(r.replace_patterns || []).length} 条
+                跳过正则 ${(r.skip_patterns || []).length} 条 · 清文正则 ${(r.strip_text_patterns || []).length} 条 · 去除正则 ${(r.strip_patterns || []).length} 条 · 替换 ${(r.replace_patterns || []).length} 条
               </div>
             </article>`
             )
@@ -754,16 +777,16 @@
               ${
                 state.phoneStep !== 'input'
                   ? `<div class="field">
-                       <label>Telegram 登录验证码</label>
-                       <input id="tg-otp" type="text" placeholder="输入收到的 5 位验证码" />
+                       <label>Telegram 登录验证码${state.phoneStep === 'need_2fa' ? '（已验证 ✓）' : ''}</label>
+                       <input id="tg-otp" type="text" value="${esc(state.phoneCode)}" placeholder="输入收到的 5 位验证码" ${state.phoneStep === 'need_2fa' ? 'disabled' : ''} />
                      </div>`
                   : ''
               }
               ${
                 state.phoneStep === 'need_2fa'
                   ? `<div class="field">
-                       <label>两步验证 (2FA) 密码</label>
-                       <input id="tg-2fa" type="password" placeholder="输入 2FA 云密码" />
+                       <label>两步验证 (2FA) 固定云密码</label>
+                       <input id="tg-2fa" type="password" placeholder="输入你设置的固定 2FA 云密码" />
                      </div>`
                   : ''
               }
@@ -948,7 +971,27 @@
     });
   }
 
-  function renderPickerItemsHtml(chatList, data, query) {
+  function getOtherRulesUsage(chat, modalIdx, accountId) {
+    const acct = accountId || 'default';
+    const srcRules = [];
+    const tgtRules = [];
+    (state.rules || []).forEach((r, i) => {
+      if (i === modalIdx) return;
+      if ((r.account_id || 'default') !== acct) return;
+      const rName = r.name || `规则#${i + 1}`;
+      if (isPeerSelected(r.sources, chat)) srcRules.push(rName);
+      if (isPeerSelected(r.targets, chat)) tgtRules.push(rName);
+    });
+    return { srcRules, tgtRules };
+  }
+
+  function fmtRuleNamesBadge(prefix, names) {
+    if (!names.length) return '';
+    const shortText = names.length === 1 ? `${prefix}: ${names[0]}` : `${prefix}: ${names[0]} 等${names.length}条`;
+    return { text: shortText, title: `${prefix}（${names.join('、')}）` };
+  }
+
+  function renderPickerItemsHtml(chatList, data, query, modalIdx = null) {
     const q = String(query || '').trim().toLowerCase();
     const filtered = q
       ? chatList.filter((c) => {
@@ -957,13 +1000,19 @@
         })
       : chatList;
     if (!filtered.length) return '<div class="hint" style="padding:12px 4px">没有匹配的频道或群组</div>';
+    const acctId = data.account_id || 'default';
     return filtered
       .map((c) => {
         const isSrc = isPeerSelected(data.sources, c);
         const isTgt = isPeerSelected(data.targets, c);
+        const other = getOtherRulesUsage(c, modalIdx, acctId);
+        const usedByOther = other.srcRules.length > 0 || other.tgtRules.length > 0;
+        const otherSrcBadge = fmtRuleNamesBadge('其他规则源', other.srcRules);
+        const otherTgtBadge = fmtRuleNamesBadge('其他规则目标', other.tgtRules);
         const kindLabel = c.kind === 'channel' ? '频道' : c.kind === 'supergroup' ? '超级群' : '群组';
+        const rowCls = isSrc || isTgt ? 'is-selected' : usedByOther ? 'is-other-selected' : '';
         return `
-          <div class="picker-item ${isSrc || isTgt ? 'is-selected' : ''}">
+          <div class="picker-item ${rowCls}">
             <div class="picker-item-meta">
               <span>${esc(c.title)}</span>
               <span class="badge muted">${kindLabel}</span>
@@ -971,6 +1020,8 @@
               ${c.noforwards ? '<span class="badge warning">禁转发</span>' : ''}
               ${isSrc ? '<span class="badge info">✓ 已选为源</span>' : ''}
               ${isTgt ? '<span class="badge success">✓ 已选为目标</span>' : ''}
+              ${otherSrcBadge ? `<span class="badge other-src" title="${esc(otherSrcBadge.title)}">${esc(otherSrcBadge.text)}</span>` : ''}
+              ${otherTgtBadge ? `<span class="badge other-tgt" title="${esc(otherTgtBadge.title)}">${esc(otherTgtBadge.text)}</span>` : ''}
             </div>
             <span class="actions" style="flex-shrink:0">
               <button type="button" class="btn small ${isSrc ? 'picked-src' : ''}" data-pick-src="${esc(c.id)}">${isSrc ? '✓ 源' : '+ 源'}</button>
@@ -1037,11 +1088,12 @@
               chatList.length
                 ? `<div class="field">
                      <label>从「${esc(accountName(data.account_id || 'default'))}」已加入频道快速勾选（共 ${chatList.length} 个 · 已选 ${(data.sources || []).length} 源 / ${(data.targets || []).length} 目标）</label>
+                     <span class="hint">蓝色高亮 = 当前规则已选；琥珀高亮 = 已被其他规则选中</span>
                      <div class="picker-toolbar">
                        <input id="rm-chat-filter" type="text" value="${esc(state.modalPickerQuery)}" placeholder="搜索频道名称、ID 或 @username..." />
                      </div>
                      <div class="picker-box" id="rm-picker-box">
-                       ${renderPickerItemsHtml(chatList, data, state.modalPickerQuery)}
+                       ${renderPickerItemsHtml(chatList, data, state.modalPickerQuery, idx)}
                      </div>
                    </div>`
                 : '<div class="hint">该账号暂无已加入频道或尚未登录，也可直接手动输入频道 ID / @username</div>'
@@ -1113,6 +1165,8 @@
                   ? `<div class="test-result" style="margin-top:8px">${
                       state.testOutput.skipped
                         ? `<span class="badge warning">已拦截跳过</span> 命中规则：<code>${esc(state.testOutput.skip_reason)}</code>（即使开启「去除全部文本」也会被拦截）`
+                        : state.testOutput.cleared_all_text
+                        ? `<span class="badge warning">已清空全部文本</span> 命中：<code>${esc(state.testOutput.clear_reason)}</code>（将仅发送媒体）`
                         : `<div><span class="badge ${state.testOutput.changed ? 'info' : 'muted'}">${state.testOutput.changed ? '已清洗' : '无变化'}</span></div><div style="margin-top:6px">${esc(state.testOutput.cleaned || '(配文已清空，仅发送媒体)')}</div>`
                     }</div>`
                   : ''
@@ -1189,7 +1243,7 @@
           </div>
 
           <div class="guide-item">
-            <strong>3. 六个规则开关说明</strong>
+            <strong>3. 七个规则开关说明</strong>
             <ul class="guide-list">
               <li><b>无来源转发</b>：不显示「转发自 xxx」；普通频道零下载秒转，保留原排版与相册。</li>
               <li><b>禁止转发频道自动下载重传</b>：遇到保护内容频道时，自动缓存下载后再上传，传完清理缓存。</li>
@@ -1553,11 +1607,16 @@
     try {
       const d = await api('/api/chats?account_id=' + encodeURIComponent(acctId));
       if (state.modalRule && state.modalRule.data.account_id === acctId) {
+        syncRuleModalFromDom();
         state.modalRule.chats = d.authorized ? d.items || [] : [];
         render();
       }
     } catch {
-      if (state.modalRule) { state.modalRule.chats = []; render(); }
+      if (state.modalRule) {
+        syncRuleModalFromDom();
+        state.modalRule.chats = [];
+        render();
+      }
     }
   }
 
@@ -1572,10 +1631,7 @@
       };
     });
     document.querySelectorAll('[data-copy]').forEach((el) => {
-      el.onclick = async () => {
-        await navigator.clipboard.writeText(el.dataset.copy);
-        toast('已复制到剪贴板', 'success');
-      };
+      el.onclick = () => copyText(el.dataset.copy);
     });
 
     const loginForm = document.getElementById('login-form');
@@ -1607,9 +1663,13 @@
     const btnLogout = document.getElementById('btn-logout');
     if (btnLogout) {
       btnLogout.onclick = async () => {
-        await api('/api/auth/logout', { method: 'POST' });
-        state.authed = false;
-        render();
+        try {
+          await api('/api/auth/logout', { method: 'POST' });
+          state.authed = false;
+          render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
       };
     }
 
@@ -1660,8 +1720,7 @@
         } catch (err) {
           delete state.resendingIds[id];
           toast(err.message, 'danger');
-          b.disabled = false;
-          b.textContent = '重发';
+          render();
         }
       };
     });
@@ -1701,11 +1760,15 @@
     const btnRefChats = document.getElementById('btn-refresh-chats');
     if (btnRefChats) {
       btnRefChats.onclick = async () => {
-        const d = await api('/api/chats?account_id=' + encodeURIComponent(state.chatsAccountId) + '&refresh=1');
-        state.chatsAuthorized = d.authorized;
-        state.chats = d.items || [];
-        toast('频道目录已刷新', 'success');
-        render();
+        try {
+          const d = await api('/api/chats?account_id=' + encodeURIComponent(state.chatsAccountId) + '&refresh=1');
+          state.chatsAuthorized = d.authorized;
+          state.chats = d.items || [];
+          toast('频道目录已刷新', 'success');
+          render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
       };
     }
 
@@ -1859,7 +1922,7 @@
           state.modalPickerQuery = chatFilterInput.value;
           const box = document.getElementById('rm-picker-box');
           if (box && state.modalRule) {
-            box.innerHTML = renderPickerItemsHtml(state.modalRule.chats || [], state.modalRule.data, state.modalPickerQuery);
+            box.innerHTML = renderPickerItemsHtml(state.modalRule.chats || [], state.modalRule.data, state.modalPickerQuery, state.modalRule.idx);
             bindPickerButtons();
           }
         };
@@ -1935,6 +1998,7 @@
         state.qrDataUrl = '';
         state.phoneStep = 'input';
         state.phoneNum = '';
+        state.phoneCode = '';
         render();
       };
     });
@@ -2079,6 +2143,7 @@
             body: JSON.stringify({ account_id: acctId, phone: state.phoneNum }),
           });
           state.phoneStep = 'verify';
+          state.phoneCode = '';
           toast('验证码已发送到你的 Telegram 客户端', 'success');
           render();
         } catch (err) {
@@ -2091,7 +2156,7 @@
     if (btnPhoneVerify && state.loginAccountId) {
       btnPhoneVerify.onclick = async () => {
         const acctId = state.loginAccountId;
-        const code = document.getElementById('tg-otp')?.value.trim() || '';
+        const code = document.getElementById('tg-otp')?.value.trim() || state.phoneCode || '';
         const password = document.getElementById('tg-2fa')?.value || '';
         try {
           const res = await api('/api/tg/phone/verify', {
@@ -2099,12 +2164,14 @@
             body: JSON.stringify({ account_id: acctId, code, password }),
           });
           if (res.need_2fa) {
+            state.phoneCode = code;
             state.phoneStep = 'need_2fa';
             toast(res.error, 'info');
             render();
             return;
           }
           state.phoneStep = 'input';
+          state.phoneCode = '';
           state.loginAccountId = '';
           toast('Telegram 账号登录成功！', 'success');
           await loadRouteData('/telegram');
@@ -2172,10 +2239,14 @@
     if (btnRotate) {
       btnRotate.onclick = async () => {
         if (!confirm('确定要重置访问 Token 吗？旧的直达链接将失效。')) return;
-        const r = await api('/api/settings/token/rotate', { method: 'POST' });
-        state.settings.access_token = r.access_token;
-        toast('访问 Token 已重置', 'success');
-        render();
+        try {
+          const r = await api('/api/settings/token/rotate', { method: 'POST' });
+          state.settings.access_token = r.access_token;
+          toast('访问 Token 已重置', 'success');
+          render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
       };
     }
 
@@ -2252,11 +2323,10 @@
       rgMode.onchange = () => { updateGen(); render(); };
       document.getElementById('rg-icase').onchange = updateGen;
       document.getElementById('rg-words').oninput = updateGen;
-      document.getElementById('btn-rg-copy').onclick = async () => {
+      document.getElementById('btn-rg-copy').onclick = () => {
         updateGen();
         if (!state.regexGen.out) return toast('请先输入关键词', 'danger');
-        await navigator.clipboard.writeText(state.regexGen.out);
-        toast('已复制生成的正则', 'success');
+        copyText(state.regexGen.out, '已复制生成的正则');
       };
       document.getElementById('btn-rg-fill').onclick = () => {
         updateGen();
@@ -2332,6 +2402,7 @@
     window.addEventListener('hashchange', () => {
       const next = location.hash.replace(/^#/, '') || '/';
       if (next !== state.route) {
+        stopQrPoll();
         state.route = next;
         loadRouteData(next);
         render();

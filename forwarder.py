@@ -19,7 +19,16 @@ from telethon.errors import (
     RPCError,
     UnauthorizedError,
 )
-from telethon.tl.types import DocumentAttributeVideo, MessageMediaDocument, MessageMediaPhoto, MessageMediaWebPage
+from telethon.tl.types import (
+    DocumentAttributeAnimated,
+    DocumentAttributeAudio,
+    DocumentAttributeSticker,
+    DocumentAttributeVideo,
+    InputMediaUploadedDocument,
+    MessageMediaDocument,
+    MessageMediaPhoto,
+    MessageMediaWebPage,
+)
 
 from common import (
     AccountConfig,
@@ -37,6 +46,8 @@ from common import (
     session_prefix_for,
     should_skip_text,
     should_strip_all_text,
+    truncate_text_with_entities,
+    utf16_len,
 )
 from web_server import WebConsole
 
@@ -66,20 +77,28 @@ class AccountRunner:
         self.account_id = acct.id
         self.account_name = acct.name
         self.enabled = acct.enabled
+        self.api_id = api_id
+        self.api_hash = api_hash
         self.manager = manager
         self.session_prefix = session_prefix_for(SESSION_DIR, acct.id)
         self.session_file = Path(f"{self.session_prefix}.session")
-        self.client = TelegramClient(str(self.session_prefix), api_id, api_hash)
+        self.client = self._build_client()
 
         self.source_map: dict[int, list[CompiledRule]] = {}
         self.target_cache: dict[int | str, Any] = {}
         self.chat_titles: dict[int, str] = {}
         self.chats_cache: list[dict[str, Any]] = []
         self._send_lock = asyncio.Lock()
+        self._auth_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._handlers_attached = False
         self.listening = False
         self._listen_task: Optional[asyncio.Task[None]] = None
+
+    def _build_client(self) -> TelegramClient:
+        client = TelegramClient(str(self.session_prefix), self.api_id, self.api_hash)
+        client.parse_mode = None
+        return client
 
     async def start(self) -> None:
         if not self.client.is_connected():
@@ -134,38 +153,87 @@ class AccountRunner:
 
     async def stop(self) -> None:
         self.listening = False
+        pending: list[asyncio.Task[Any]] = []
         for t in list(self._bg_tasks):
             if not t.done():
                 t.cancel()
+                pending.append(t)
         self._bg_tasks.clear()
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
-        if self.client.is_connected():
+            pending.append(self._listen_task)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._listen_task = None
+        if self.client and self.client.is_connected():
             await self.client.disconnect()
 
+    async def logout(self) -> None:
+        self.listening = False
+        pending: list[asyncio.Task[Any]] = []
+        for t in list(self._bg_tasks):
+            if not t.done():
+                t.cancel()
+                pending.append(t)
+        self._bg_tasks.clear()
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
+            pending.append(self._listen_task)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._listen_task = None
+
+        try:
+            if self.client and getattr(self.client, "session", None) is not None:
+                if not self.client.is_connected():
+                    await self.client.connect()
+                if await self.client.is_user_authorized():
+                    await self.client.log_out()
+                elif self.client.is_connected():
+                    await self.client.disconnect()
+        except Exception as exc:
+            log.warning("[%s] Logout warning: %s", self.account_name, exc)
+            try:
+                if self.client and self.client.is_connected():
+                    await self.client.disconnect()
+            except Exception:
+                pass
+
+        self.mark_unauthorized()
+        for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+            Path(f"{self.session_prefix}{suffix}").unlink(missing_ok=True)
+        self._handlers_attached = False
+        self.client = self._build_client()
+        if self.enabled:
+            try:
+                await self.client.connect()
+            except Exception as exc:
+                log.warning("[%s] Reconnect after logout warning: %s", self.account_name, exc)
+
     async def on_user_authorized(self) -> None:
-        me = await self.client.get_me()
-        if me is None:
-            self.mark_unauthorized()
-            log.warning("[%s] Session not authorized (get_me returned None)", self.account_name)
-            return
-        log.info("[%s] Logged in as %s (id=%s)", self.account_name, me.username or me.first_name, me.id)
-        if not self._handlers_attached:
-            @self.client.on(events.Album())
-            async def _album_handler(event: events.Album.Event) -> None:
-                await self.process_album(event)
+        async with self._auth_lock:
+            me = await self.client.get_me()
+            if me is None:
+                self.mark_unauthorized()
+                log.warning("[%s] Session not authorized (get_me returned None)", self.account_name)
+                return
+            log.info("[%s] Logged in as %s (id=%s)", self.account_name, me.username or me.first_name, me.id)
+            if not self._handlers_attached:
+                @self.client.on(events.Album())
+                async def _album_handler(event: events.Album.Event) -> None:
+                    await self.process_album(event)
 
-            @self.client.on(events.NewMessage())
-            async def _msg_handler(event: events.NewMessage.Event) -> None:
-                await self.process_single(event)
+                @self.client.on(events.NewMessage())
+                async def _msg_handler(event: events.NewMessage.Event) -> None:
+                    await self.process_single(event)
 
-            self._handlers_attached = True
+                self._handlers_attached = True
 
-        await self.refresh_routes(self.manager.cfg)
-        self.listening = True
-        if self._listen_task is None or self._listen_task.done():
-            self._listen_task = asyncio.create_task(self._run_listener())
-        log.info("[%s] Listening for updates...", self.account_name)
+            await self.refresh_routes(self.manager.cfg)
+            self.listening = True
+            if self._listen_task is None or self._listen_task.done():
+                self._listen_task = asyncio.create_task(self._run_listener())
+            log.info("[%s] Listening for updates...", self.account_name)
 
     @staticmethod
     def _entity_title(ent: Any, fallback: Any) -> str:
@@ -182,7 +250,7 @@ class AccountRunner:
         new_source_map: dict[int, list[CompiledRule]] = {}
         new_target_cache: dict[int | str, Any] = {}
 
-        if self.enabled and await self.client.is_user_authorized():
+        if self.enabled and await self.ensure_authorized(verify_live=False):
             for rule in cfg.rules:
                 if not rule.enabled or rule.account_id != self.account_id:
                     continue
@@ -191,7 +259,9 @@ class AccountRunner:
                         ent = await self.client.get_entity(src)
                         peer_id = utils.get_peer_id(ent)
                         self.chat_titles[peer_id] = self._entity_title(ent, src)
-                        new_source_map.setdefault(peer_id, []).append(rule)
+                        lst = new_source_map.setdefault(peer_id, [])
+                        if rule not in lst:
+                            lst.append(rule)
                     except Exception as exc:
                         log.warning("[%s] Cannot resolve source %r in rule %r: %s", self.account_name, src, rule.name, exc)
                 for tgt in rule.targets:
@@ -215,14 +285,16 @@ class AccountRunner:
     def _rules_for_chat(self, chat_id: int) -> list[CompiledRule]:
         return self.source_map.get(chat_id, [])
 
-    async def _call_with_flood_retry(self, coro_factory):
-        try:
-            return await coro_factory()
-        except FloodWaitError as exc:
-            wait_s = exc.seconds + 1
-            log.warning("[%s] FloodWait %ss; sleeping before retry", self.account_name, wait_s)
-            await asyncio.sleep(wait_s)
-            return await coro_factory()
+    async def _call_with_flood_retry(self, coro_factory, max_attempts: int = 3):
+        for attempt in range(max_attempts):
+            try:
+                return await coro_factory()
+            except FloodWaitError as exc:
+                if attempt + 1 >= max_attempts:
+                    raise
+                wait_s = exc.seconds + 1
+                log.warning("[%s] FloodWait %ss; sleeping before retry (%d/%d)", self.account_name, wait_s, attempt + 1, max_attempts)
+                await asyncio.sleep(wait_s)
 
     @staticmethod
     def _is_noforwards(chat: Any, msgs: list[Any]) -> bool:
@@ -243,12 +315,15 @@ class AccountRunner:
             doc = getattr(media, "document", None)
             mime = str(getattr(doc, "mime_type", "") or "").lower()
             attrs = getattr(doc, "attributes", None) or []
-            is_sticker_or_voice = any(
-                type(a).__name__ in ("DocumentAttributeSticker", "DocumentAttributeAudio") and getattr(a, "voice", False)
+            if any(
+                isinstance(a, (DocumentAttributeSticker, DocumentAttributeAnimated))
+                or (isinstance(a, DocumentAttributeAudio) and getattr(a, "voice", False))
+                or (isinstance(a, DocumentAttributeVideo) and getattr(a, "round_message", False))
                 for a in attrs
-            )
-            if is_sticker_or_voice:
+            ):
                 return "single"
+            if any(isinstance(a, DocumentAttributeAudio) for a in attrs):
+                return "audio"
             if mime.startswith("video/") or any(isinstance(a, DocumentAttributeVideo) for a in attrs):
                 return "pv"
             return "doc"
@@ -306,6 +381,9 @@ class AccountRunner:
     ) -> bool:
         cfg = self.manager.cfg
         if not self._is_real_media(msg):
+            if not (text or "").strip():
+                log.warning("Skip empty text-only restricted msg %s", msg.id)
+                return False
             await self._call_with_flood_retry(
                 lambda: self.client.send_message(
                     target_ent,
@@ -321,6 +399,7 @@ class AccountRunner:
             log.warning("Skip restricted msg %s: size %.1fMB > max_download_mb %dMB", msg.id, size_mb, cfg.max_download_mb)
             return False
 
+        cap, ents = truncate_text_with_entities(text, entities, 1024)
         work_dir = cfg.temp_dir / f"job_{uuid.uuid4().hex[:12]}"
         work_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -342,8 +421,8 @@ class AccountRunner:
                 lambda: self.client.send_file(
                     target_ent,
                     file_path,
-                    caption=text,
-                    formatting_entities=entities,
+                    caption=cap,
+                    formatting_entities=ents,
                     supports_streaming=is_video,
                     attributes=video_attrs,
                     thumb=thumb_path,
@@ -369,21 +448,72 @@ class AccountRunner:
         work_dir = cfg.temp_dir / f"album_{uuid.uuid4().hex[:12]}"
         work_dir.mkdir(parents=True, exist_ok=True)
         try:
-            paths: list[str] = []
-            for m in msgs:
+            items: list[tuple[Any, str, list[Any]]] = []
+            dropped_caption: Optional[tuple[str, list[Any]]] = None
+            for idx, m in enumerate(msgs):
+                raw_cap = captions[idx] if idx < len(captions) else ""
+                raw_ents = entities_list[idx] if idx < len(entities_list) else []
+                cap, ents = truncate_text_with_entities(raw_cap, raw_ents, 1024)
                 p = await self._call_with_flood_retry(
                     lambda msg_obj=m: self.client.download_media(msg_obj, file=str(work_dir) + "/")
                 )
-                if p:
-                    paths.append(p)
-            if not paths:
+                if not p:
+                    if cap and dropped_caption is None:
+                        dropped_caption = (cap, ents or [])
+                    continue
+                is_video, video_attrs = self._extract_video_attrs(m)
+                if is_video and video_attrs:
+                    uploaded = await self._call_with_flood_retry(
+                        lambda fp=p: self.client.upload_file(fp)
+                    )
+                    uploaded_thumb = None
+                    if getattr(m.document, "thumbs", None):
+                        tpath = await self.client.download_media(
+                            m, thumb=-1, file=str(work_dir / f"thumb_{idx}.jpg")
+                        )
+                        if tpath:
+                            uploaded_thumb = await self._call_with_flood_retry(
+                                lambda tp=tpath: self.client.upload_file(tp)
+                            )
+                    mime = str(getattr(m.document, "mime_type", "") or "video/mp4")
+                    media_obj: Any = InputMediaUploadedDocument(
+                        file=uploaded,
+                        thumb=uploaded_thumb,
+                        mime_type=mime,
+                        attributes=video_attrs,
+                    )
+                    items.append((media_obj, cap, ents or []))
+                else:
+                    items.append((p, cap, ents or []))
+
+            if not items:
                 return False
+            if dropped_caption is not None and not any(c for _, c, _ in items):
+                m0, _, _ = items[0]
+                items[0] = (m0, dropped_caption[0], dropped_caption[1])
+
+            if len(items) == 1:
+                media0, cap0, ent0 = items[0]
+                await self._call_with_flood_retry(
+                    lambda: self.client.send_file(
+                        target_ent,
+                        media0,
+                        caption=cap0,
+                        formatting_entities=ent0 or None,
+                        supports_streaming=True,
+                    )
+                )
+                return True
+
+            files_out = [x[0] for x in items]
+            caps_out = [x[1] for x in items]
+            ents_out = [x[2] for x in items]
             await self._call_with_flood_retry(
                 lambda: self.client.send_file(
                     target_ent,
-                    paths,
-                    caption=captions[: len(paths)],
-                    formatting_entities=entities_list[: len(paths)],
+                    files_out,
+                    caption=caps_out,
+                    formatting_entities=ents_out,
                     supports_streaming=True,
                 )
             )
@@ -551,23 +681,27 @@ class AccountRunner:
             else:
                 cleaned_text, cleaned_entities, _ = clean_message_text(chosen_text, chosen_entities, rule)
 
-            if target_override is None and total_media == 0 and not cleaned_text.strip() and (rule.skip_empty_text_only or clear_caption):
-                self.manager.history.record(
-                    account_id=self.account_id,
-                    account_name=self.account_name,
-                    rule_name=rule.name,
-                    source_id=source_id,
-                    source_title=source_title,
-                    target_id=0,
-                    target_title="-",
-                    msg_id=lead_id,
-                    item_count=1,
-                    mode="skip_empty",
-                    status="skipped",
-                    preview=raw_preview,
-                    detail="清洗后为空文本",
-                )
-                return False, "清洗后为空文本"
+            if total_media == 0 and not cleaned_text.strip():
+                if target_override is not None:
+                    return False, "清洗后为空文本，无法发送"
+                if rule.skip_empty_text_only or clear_caption:
+                    self.manager.history.record(
+                        account_id=self.account_id,
+                        account_name=self.account_name,
+                        rule_name=rule.name,
+                        source_id=source_id,
+                        source_title=source_title,
+                        target_id=0,
+                        target_title="-",
+                        msg_id=lead_id,
+                        item_count=1,
+                        mode="skip_empty",
+                        status="skipped",
+                        preview=raw_preview,
+                        detail="清洗后为空文本",
+                    )
+                    return False, "清洗后为空文本"
+                return False, "清洗后为空文本，无法发送"
 
             chunks = build_media_chunks(all_batches, rule.comment_merge_mode, self._media_bucket, max_album=10)
             clean_preview = cleaned_text or (f"[评论区合并 {total_media} 项]" if comment_batches else f"[媒体 {total_media} 项]")
@@ -625,11 +759,26 @@ class AccountRunner:
                     else:
                         any_reuploaded = False
                         aborted = False
+                        split_long_text = utf16_len(cleaned_text) > 1024
+                        if split_long_text:
+                            lead_msg = main_msgs[0]
+                            await self._call_with_flood_retry(
+                                lambda: self.client.send_message(
+                                    target_ent,
+                                    cleaned_text,
+                                    formatting_entities=cleaned_entities,
+                                    link_preview=(not rule.disable_link_preview)
+                                    and isinstance(lead_msg.media, MessageMediaWebPage),
+                                )
+                            )
+                            await asyncio.sleep(min(1.5, max(0.5, self.manager.cfg.delay_seconds or 1.0)))
                         for c_idx, chunk in enumerate(chunks):
                             if c_idx > 0:
                                 await asyncio.sleep(min(2.0, max(0.8, self.manager.cfg.delay_seconds or 1.0)))
-                            cap = cleaned_text if c_idx == 0 else ""
-                            ents = cleaned_entities if c_idx == 0 else None
+                            if c_idx == 0 and not split_long_text:
+                                cap, ents = truncate_text_with_entities(cleaned_text, cleaned_entities, 1024)
+                            else:
+                                cap, ents = "", None
                             restricted = self._is_noforwards(chat, chunk)
                             if not restricted:
                                 try:
@@ -781,14 +930,20 @@ class AccountRunner:
         mode = "copy"
         try:
             restricted = self._is_noforwards(chat, [msg])
-            if not restricted and (not changed or clear_caption) and rule.drop_author:
+            needs_strip_preview = (not has_real_media) and rule.disable_link_preview and isinstance(msg.media, MessageMediaWebPage)
+            can_server_forward = (
+                not restricted
+                and not needs_strip_preview
+                and ((not changed and not clear_caption) or (clear_caption and rule.drop_author))
+            )
+            if can_server_forward:
                 try:
                     await self._call_with_flood_retry(
                         lambda: self.client.forward_messages(
                             target_ent,
                             msg.id,
                             source_id,
-                            drop_author=True,
+                            drop_author=rule.drop_author,
                             drop_media_captions=clear_caption,
                         )
                     )
@@ -799,15 +954,18 @@ class AccountRunner:
                 try:
                     mode = "cleaned"
                     if has_real_media:
+                        safe_cap, safe_ents = truncate_text_with_entities(cleaned_text, cleaned_entities, 1024)
                         await self._call_with_flood_retry(
                             lambda: self.client.send_file(
                                 target_ent,
                                 msg.media,
-                                caption=cleaned_text,
-                                formatting_entities=cleaned_entities,
+                                caption=safe_cap,
+                                formatting_entities=safe_ents,
                             )
                         )
                     else:
+                        if not cleaned_text.strip():
+                            return False, "清洗后为空文本，无法发送"
                         await self._call_with_flood_retry(
                             lambda: self.client.send_message(
                                 target_ent,
@@ -916,16 +1074,19 @@ class AccountRunner:
         mode = "copy"
         try:
             restricted = self._is_noforwards(chat, msgs)
-            if not restricted and (not any_changed or clear_caption) and rule.drop_author:
+            can_server_forward = (
+                not restricted
+                and ((not any_changed and not clear_caption) or (clear_caption and rule.drop_author))
+            )
+            if can_server_forward:
                 try:
                     await self._call_with_flood_retry(
                         lambda: self.client.forward_messages(
                             target_ent,
                             [m.id for m in msgs],
                             source_id,
-                            drop_author=True,
+                            drop_author=rule.drop_author,
                             drop_media_captions=clear_caption,
-                            as_album=True,
                         )
                     )
                     mode = "cleaned" if clear_caption and any_changed else "copy"
@@ -936,12 +1097,18 @@ class AccountRunner:
                     mode = "cleaned"
                     media_list = [m.media for m in msgs if self._is_real_media(m)]
                     if len(media_list) == len(msgs):
+                        safe_caps: list[str] = []
+                        safe_ents: list[list[Any]] = []
+                        for c_txt, c_ent in zip(captions, entities_list):
+                            sc, se = truncate_text_with_entities(c_txt, c_ent, 1024)
+                            safe_caps.append(sc)
+                            safe_ents.append(se or [])
                         await self._call_with_flood_retry(
                             lambda: self.client.send_file(
                                 target_ent,
                                 media_list,
-                                caption=captions,
-                                formatting_entities=entities_list,
+                                caption=safe_caps,
+                                formatting_entities=safe_ents,
                             )
                         )
                     else:
@@ -1042,6 +1209,9 @@ class AccountRunner:
         for r in self.manager.cfg.rules:
             if r.account_id == self.account_id and source_id in r.sources:
                 return r
+        mapped = self.source_map.get(source_id) or []
+        if mapped:
+            return mapped[0]
         mode = str(item.get("mode") or "")
         return CompiledRule(
             name=rule_name or "手动重发",

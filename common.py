@@ -101,6 +101,16 @@ def _compile_patterns(items: Sequence[str] | None, field_name: str) -> list[re.P
     return compiled
 
 
+def _validate_replace_template(rx: re.Pattern[str], repl: str) -> None:
+    parser_mod = getattr(re, "_parser", None)
+    parse_tpl = getattr(parser_mod, "parse_template", None) if parser_mod else None
+    if parse_tpl is not None:
+        try:
+            parse_tpl(repl, rx)
+        except (re.error, IndexError) as exc:
+            raise ValueError(f"Invalid replacement template {repl!r}: {exc}") from exc
+
+
 def compile_rule_dict(
     r: dict[str, Any],
     idx: int = 0,
@@ -111,14 +121,18 @@ def compile_rule_dict(
     account_id = str(r.get("account_id") or "default").strip() or "default"
     replaces: list[CompiledReplace] = []
     for rep in r.get("replace_patterns") or []:
+        if not isinstance(rep, dict):
+            continue
         pat = str(rep.get("pattern") or "")
         if not pat:
             continue
         repl = str(rep.get("repl", ""))
         try:
-            replaces.append(CompiledReplace(re.compile(pat, re.MULTILINE), repl))
+            rx = re.compile(pat, re.MULTILINE)
         except re.error as exc:
             raise ValueError(f"Invalid replace regex in {name}: {pat!r} ({exc})") from exc
+        _validate_replace_template(rx, repl)
+        replaces.append(CompiledReplace(rx, repl))
     raw_cw = r.get("comment_wait_seconds")
     cw = default_comment_wait if raw_cw in (None, "") else max(5, min(300, int(raw_cw)))
     raw_cm = str(r.get("comment_merge_mode") or "").strip()
@@ -166,11 +180,15 @@ def load_raw_config(config_path: Path) -> dict[str, Any]:
 def save_raw_config(config_path: Path, data: dict[str, Any]) -> None:
     for idx, r in enumerate(data.get("rules") or []):
         compile_rule_dict(r, idx)
-    tmp_path = config_path.with_suffix(".yaml.tmp")
+    tmp_path = config_path.with_name(f".{config_path.name}.{secrets.token_hex(4)}.tmp")
     text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, indent=2)
-    tmp_path.write_text(text, encoding="utf-8")
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, config_path)
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, config_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 def resolve_tg_api(raw: dict[str, Any]) -> tuple[int, str, bool]:
@@ -318,9 +336,15 @@ def clean_message_text(
         cur_text, cur_spans = _apply_regex_with_spans(cur_text, pat, lambda _m: "", cur_spans)
 
     for rep in rule.replace_patterns:
-        cur_text, cur_spans = _apply_regex_with_spans(
-            cur_text, rep.regex, lambda m, r=rep.repl: m.expand(r), cur_spans
-        )
+        try:
+            cur_text, cur_spans = _apply_regex_with_spans(
+                cur_text, rep.regex, lambda m, r=rep.repl: m.expand(r), cur_spans
+            )
+        except (re.error, IndexError) as exc:
+            raise ValueError(f"Invalid replacement template {rep.repl!r}: {exc}") from exc
+
+    if cur_text == orig:
+        return orig, (list(entities) if entities else None), False
 
     cur_text, cur_spans = _apply_regex_with_spans(
         cur_text, re.compile(r"\n{3,}"), lambda _m: "\n\n", cur_spans
@@ -348,6 +372,53 @@ def clean_message_text(
             out_entities.append(ent)
 
     return cur_text, (out_entities or None), True
+
+
+def utf16_len(text: Optional[str]) -> int:
+    if not text:
+        return 0
+    return len(text.encode("utf-16-le")) // 2
+
+
+def truncate_text_with_entities(
+    text: Optional[str],
+    entities: Optional[Sequence[Any]],
+    max_utf16: int = 1024,
+    ellipsis: str = "…",
+) -> tuple[str, Optional[list[Any]]]:
+    orig = text or ""
+    if not orig or utf16_len(orig) <= max_utf16:
+        return orig, (list(entities) if entities else None)
+
+    ell_u = utf16_len(ellipsis)
+    budget = max(1, max_utf16 - ell_u)
+    u = 0
+    cut_cp = 0
+    for idx, ch in enumerate(orig):
+        ch_u = len(ch.encode("utf-16-le")) // 2
+        if u + ch_u > budget:
+            break
+        u += ch_u
+        cut_cp = idx + 1
+
+    clipped = orig[:cut_cp].rstrip()
+    cut_u = utf16_len(clipped)
+    out_text = clipped + ellipsis
+
+    out_ents: list[Any] = []
+    for ent in entities or []:
+        e_start = int(getattr(ent, "offset", 0))
+        e_end = e_start + int(getattr(ent, "length", 0))
+        if e_start >= cut_u:
+            continue
+        ne_end = min(e_end, cut_u)
+        if ne_end <= e_start:
+            continue
+        ne = copy.copy(ent)
+        ne.offset = e_start
+        ne.length = ne_end - e_start
+        out_ents.append(ne)
+    return out_text, (out_ents or None)
 
 
 def build_media_chunks(
@@ -391,9 +462,24 @@ def build_media_chunks(
     return _split_compatible(flat)
 
 
+def _open_sqlite(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=15.0)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+    except sqlite3.DatabaseError:
+        pass
+    try:
+        if Path(db_path).exists():
+            os.chmod(db_path, 0o600)
+    except OSError:
+        pass
+    return conn
+
+
 class DedupStore:
     def __init__(self, db_path: Path) -> None:
-        self.conn = sqlite3.connect(db_path)
+        self.conn = _open_sqlite(db_path)
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS forwarded_v2 (
@@ -444,7 +530,7 @@ class HistoryStore:
         self.db_path = Path(db_path)
         self.retention_days = max(0, int(retention_days))
         self.max_rows = max(100, int(max_rows))
-        self.conn = sqlite3.connect(db_path)
+        self.conn = _open_sqlite(db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(
             """
@@ -689,7 +775,7 @@ class AuthStore:
     SESSION_TTL = 14 * 86400
 
     def __init__(self, db_path: Path) -> None:
-        self.conn = sqlite3.connect(db_path)
+        self.conn = _open_sqlite(db_path)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
@@ -757,10 +843,15 @@ class AuthStore:
         expected = self.get_access_token()
         return bool(token) and bool(expected) and hmac.compare_digest(token, expected)
 
-    def change_password(self, current_password: str, new_password: str) -> bool:
+    def change_password(self, current_password: str, new_password: str, keep_session: str = "") -> bool:
         if not self.verify_password(current_password):
             return False
         self._set("password_hash", self._hash_password(new_password))
+        if keep_session:
+            self.conn.execute("DELETE FROM web_sessions WHERE token != ?", (keep_session,))
+        else:
+            self.conn.execute("DELETE FROM web_sessions")
+        self.conn.commit()
         return True
 
     def create_session(self) -> str:

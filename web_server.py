@@ -41,7 +41,55 @@ class WebConsole:
         self._qr_objs: dict[str, Any] = {}
         self._qr_tasks: dict[str, asyncio.Task[None]] = {}
         self._qr_states: dict[str, dict[str, Any]] = {}
-        self._phone_states: dict[str, tuple[str, str]] = {}
+        self._phone_states: dict[str, dict[str, Any]] = {}
+        self._config_lock = asyncio.Lock()
+
+    @staticmethod
+    def _is_https(request: web.Request) -> bool:
+        return request.scheme == "https" or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+    @staticmethod
+    async def _read_json(request: web.Request, allow_empty: bool = False) -> dict[str, Any]:
+        if allow_empty and not request.can_read_body:
+            return {}
+        try:
+            data = await request.json()
+        except Exception:
+            if allow_empty:
+                return {}
+            raise web.HTTPBadRequest(text='{"error":"请求体不是有效的 JSON"}', content_type="application/json")
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest(text='{"error":"请求体必须是 JSON 对象"}', content_type="application/json")
+        return data
+
+    @staticmethod
+    def _parse_int(val: Any, field: str, default: int | None = None) -> int:
+        if val is None or (isinstance(val, str) and not val.strip()):
+            if default is not None:
+                return default
+            raise ValueError(f"{field} 必须是整数")
+        if isinstance(val, bool):
+            raise ValueError(f"{field} 必须是整数")
+        try:
+            return int(val)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} 必须是有效整数") from exc
+
+    @staticmethod
+    def _parse_float(val: Any, field: str, default: float | None = None) -> float:
+        if val is None or (isinstance(val, str) and not val.strip()):
+            if default is not None:
+                return default
+            raise ValueError(f"{field} 必须是数字")
+        if isinstance(val, bool):
+            raise ValueError(f"{field} 必须是数字")
+        try:
+            f = float(val)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} 必须是有效数字") from exc
+        if f != f or f in (float("inf"), float("-inf")):
+            raise ValueError(f"{field} 必须是有效数字")
+        return f
 
     def _is_authed(self, request: web.Request) -> bool:
         sess = request.cookies.get(SESSION_COOKIE, "")
@@ -80,6 +128,7 @@ class WebConsole:
                 sess,
                 max_age=self.auth.SESSION_TTL,
                 httponly=True,
+                secure=self._is_https(request),
                 samesite="Lax",
                 path="/",
             )
@@ -106,7 +155,7 @@ class WebConsole:
         return web.json_response({"authenticated": self._is_authed(request)})
 
     async def handle_login(self, request: web.Request) -> web.Response:
-        data = await request.json()
+        data = await self._read_json(request)
         password = str(data.get("password") or "")
         token = str(data.get("token") or "")
         ok = False
@@ -123,6 +172,7 @@ class WebConsole:
             sess,
             max_age=self.auth.SESSION_TTL,
             httponly=True,
+            secure=self._is_https(request),
             samesite="Lax",
             path="/",
         )
@@ -136,14 +186,15 @@ class WebConsole:
         return resp
 
     async def handle_change_password(self, request: web.Request) -> web.Response:
-        data = await request.json()
+        data = await self._read_json(request)
         cur = str(data.get("current_password") or "")
         new_p = str(data.get("new_password") or "")
         if len(new_p) < 8:
             return web.json_response({"error": "新密码至少需要 8 位字符"}, status=400)
-        if not self.auth.change_password(cur, new_p):
+        cur_sess = request.cookies.get(SESSION_COOKIE, "")
+        if not self.auth.change_password(cur, new_p, keep_session=cur_sess):
             return web.json_response({"error": "当前密码不正确"}, status=400)
-        return web.json_response({ "ok": True })
+        return web.json_response({"ok": True})
 
     async def _runner_summary(self, acct_dict: dict[str, Any], rules: list[dict[str, Any]]) -> dict[str, Any]:
         acct_id = str(acct_dict["id"])
@@ -196,66 +247,69 @@ class WebConsole:
         return web.json_response({"items": await self._all_accounts_summary()})
 
     async def handle_account_create(self, request: web.Request) -> web.Response:
-        data = await request.json()
+        data = await self._read_json(request)
         name = str(data.get("name") or "").strip()
         if not name:
             return web.json_response({"error": "请填写账号名称"}, status=400)
-        raw = load_raw_config(self.config_path)
-        acct_id = "acct_" + secrets.token_hex(3)
-        raw["accounts"].append({"id": acct_id, "name": name, "enabled": True})
-        save_raw_config(self.config_path, raw)
-        await self.manager.reload_all(force=True)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            acct_id = "acct_" + secrets.token_hex(3)
+            raw["accounts"].append({"id": acct_id, "name": name, "enabled": True})
+            save_raw_config(self.config_path, raw)
+            await self.manager.reload_all(force=True)
         return web.json_response({"ok": True, "id": acct_id, "items": await self._all_accounts_summary()})
 
     async def handle_account_update(self, request: web.Request) -> web.Response:
         acct_id = request.match_info["acct_id"]
-        data = await request.json()
-        raw = load_raw_config(self.config_path)
-        found = None
-        for a in raw["accounts"]:
-            if a["id"] == acct_id:
-                found = a
-                break
-        if not found:
-            return web.json_response({"error": "账号不存在"}, status=404)
-        if "name" in data and str(data["name"]).strip():
-            found["name"] = str(data["name"]).strip()
-        if "enabled" in data:
-            found["enabled"] = bool(data["enabled"])
-        save_raw_config(self.config_path, raw)
-        await self.manager.reload_all(force=True)
+        data = await self._read_json(request)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            found = None
+            for a in raw["accounts"]:
+                if a["id"] == acct_id:
+                    found = a
+                    break
+            if not found:
+                return web.json_response({"error": "账号不存在"}, status=404)
+            if "name" in data and str(data["name"]).strip():
+                found["name"] = str(data["name"]).strip()
+            if "enabled" in data:
+                found["enabled"] = bool(data["enabled"])
+            save_raw_config(self.config_path, raw)
+            await self.manager.reload_all(force=True)
         return web.json_response({"ok": True, "items": await self._all_accounts_summary()})
 
     async def handle_account_delete(self, request: web.Request) -> web.Response:
         acct_id = request.match_info["acct_id"]
-        raw = load_raw_config(self.config_path)
-        if len(raw["accounts"]) <= 1:
-            return web.json_response({"error": "至少需保留 1 个账号"}, status=400)
-        new_accts = [a for a in raw["accounts"] if a["id"] != acct_id]
-        if len(new_accts) == len(raw["accounts"]):
-            return web.json_response({"error": "账号不存在"}, status=404)
-        if any((r.get("account_id") or "default") == acct_id for r in (raw.get("rules") or [])):
-            return web.json_response({"error": "还有规则绑定在这个账号上，请先删除或改绑规则"}, status=400)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            if len(raw["accounts"]) <= 1:
+                return web.json_response({"error": "至少需保留 1 个账号"}, status=400)
+            new_accts = [a for a in raw["accounts"] if a["id"] != acct_id]
+            if len(new_accts) == len(raw["accounts"]):
+                return web.json_response({"error": "账号不存在"}, status=404)
+            if any((r.get("account_id") or "default") == acct_id for r in (raw.get("rules") or [])):
+                return web.json_response({"error": "还有规则绑定在这个账号上，请先删除或改绑规则"}, status=400)
 
-        task = self._qr_tasks.pop(acct_id, None)
-        if task and not task.done():
-            task.cancel()
-        runner = self.manager.get_runner(acct_id)
-        if runner:
-            try:
-                if await runner.client.is_user_authorized():
-                    await runner.client.log_out()
-            except Exception:
-                pass
-            await runner.stop()
+            task = self._qr_tasks.pop(acct_id, None)
+            if task and not task.done():
+                task.cancel()
+            self._qr_objs.pop(acct_id, None)
+            self._qr_states.pop(acct_id, None)
+            self._phone_states.pop(acct_id, None)
+            runner = self.manager.get_runner(acct_id)
+            if runner:
+                runner.enabled = False
+                await runner.logout()
+                await runner.stop()
 
-        prefix = session_prefix_for(self.session_dir, acct_id)
-        for suffix in (".session", ".session-journal"):
-            Path(f"{prefix}{suffix}").unlink(missing_ok=True)
+            prefix = session_prefix_for(self.session_dir, acct_id)
+            for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+                Path(f"{prefix}{suffix}").unlink(missing_ok=True)
 
-        raw["accounts"] = new_accts
-        save_raw_config(self.config_path, raw)
-        await self.manager.reload_all(force=True)
+            raw["accounts"] = new_accts
+            save_raw_config(self.config_path, raw)
+            await self.manager.reload_all(force=True)
         return web.json_response({"ok": True, "items": await self._all_accounts_summary()})
 
     async def handle_overview(self, _request: web.Request) -> web.Response:
@@ -308,6 +362,7 @@ class WebConsole:
                         "strip_all_text": bool(r.get("strip_all_text", False)),
                         "fallback_reupload": bool(r.get("fallback_reupload", True)),
                         "filters_count": len(r.get("skip_patterns") or [])
+                        + len(r.get("strip_text_patterns") or [])
                         + len(r.get("strip_patterns") or [])
                         + len(r.get("replace_patterns") or []),
                     }
@@ -354,25 +409,30 @@ class WebConsole:
         )
 
     async def handle_logs_manage_put(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        raw = load_raw_config(self.config_path)
-        g = raw.setdefault("global", {})
-        if "log_retention_days" in data:
-            g["log_retention_days"] = max(0, int(data.get("log_retention_days", 30)))
-        if "log_max_rows" in data:
-            g["log_max_rows"] = max(100, int(data.get("log_max_rows", 5000)))
-        save_raw_config(self.config_path, raw)
-        await self.manager.reload_all(force=True)
-        pruned = self.manager.history.prune(
-            max(0, int(g.get("log_retention_days", 30))),
-            max(100, int(g.get("log_max_rows", 5000))),
-        )
+        data = await self._read_json(request)
+        try:
+            new_days = max(0, self._parse_int(data.get("log_retention_days"), "log_retention_days", default=30)) if "log_retention_days" in data else None
+            new_rows = max(100, self._parse_int(data.get("log_max_rows"), "log_max_rows", default=5000)) if "log_max_rows" in data else None
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            g = raw.setdefault("global", {})
+            if new_days is not None:
+                g["log_retention_days"] = new_days
+            if new_rows is not None:
+                g["log_max_rows"] = new_rows
+            days_eff = max(0, int(g.get("log_retention_days", 30)))
+            rows_eff = max(100, int(g.get("log_max_rows", 5000)))
+            save_raw_config(self.config_path, raw)
+            pruned = self.manager.history.prune(days_eff, rows_eff)
+            await self.manager.reload_all(force=True)
         return web.json_response(
             {
                 "ok": True,
                 "pruned": pruned,
-                "log_retention_days": max(0, int(g.get("log_retention_days", 30))),
-                "log_max_rows": max(100, int(g.get("log_max_rows", 5000))),
+                "log_retention_days": days_eff,
+                "log_max_rows": rows_eff,
                 "stats": self.manager.history.stats_detail(),
             }
         )
@@ -382,13 +442,16 @@ class WebConsole:
         return web.json_response({"ok": True, "deleted": deleted, "stats": self.manager.history.stats_detail()})
 
     async def handle_logs_clear(self, request: web.Request) -> web.Response:
-        data = await request.json() if request.can_read_body else {}
-        status = str((data or {}).get("status") or "").strip()
+        data = await self._read_json(request, allow_empty=True)
+        status = str(data.get("status") or "").strip()
         deleted = self.manager.history.clear(status)
         return web.json_response({"ok": True, "deleted": deleted, "stats": self.manager.history.stats_detail()})
 
     async def handle_log_resend(self, request: web.Request) -> web.Response:
-        row_id = int(request.match_info["row_id"])
+        try:
+            row_id = int(request.match_info["row_id"])
+        except ValueError:
+            return web.json_response({"error": "无效的记录 ID"}, status=400)
         item = self.manager.history.get_by_id(row_id)
         if not item:
             return web.json_response({"error": "记录不存在或已被清理"}, status=404)
@@ -465,62 +528,76 @@ class WebConsole:
         }
         raw_cw = data.get("comment_wait_seconds")
         if raw_cw not in (None, ""):
-            rule_dict["comment_wait_seconds"] = max(5, min(300, int(raw_cw)))
+            rule_dict["comment_wait_seconds"] = max(5, min(300, WebConsole._parse_int(raw_cw, "comment_wait_seconds")))
         raw_cm = str(data.get("comment_merge_mode") or "").strip()
         if raw_cm in ("pack", "keep_batches"):
             rule_dict["comment_merge_mode"] = raw_cm
         return rule_dict
 
     async def handle_rule_create(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        raw = load_raw_config(self.config_path)
-        default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
-        rule = self._sanitize_rule_payload(data, default_acct)
-        raw["rules"].append(rule)
-        try:
-            save_raw_config(self.config_path, raw)
-        except ValueError as exc:
-            return web.json_response({"error": f"正则表达式有误: {exc}"}, status=400)
-        await self.manager.reload_all(force=True)
+        data = await self._read_json(request)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
+            try:
+                rule = self._sanitize_rule_payload(data, default_acct)
+                raw["rules"].append(rule)
+                save_raw_config(self.config_path, raw)
+            except ValueError as exc:
+                return web.json_response({"error": f"规则参数或正则有误: {exc}"}, status=400)
+            await self.manager.reload_all(force=True)
         return web.json_response({"ok": True, "rules": raw["rules"]})
 
     async def handle_rule_update(self, request: web.Request) -> web.Response:
-        idx = int(request.match_info["idx"])
-        data = await request.json()
-        raw = load_raw_config(self.config_path)
-        if idx < 0 or idx >= len(raw["rules"]):
-            return web.json_response({"error": "规则不存在"}, status=404)
-        default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
-        raw["rules"][idx] = self._sanitize_rule_payload(data, default_acct)
         try:
-            save_raw_config(self.config_path, raw)
-        except ValueError as exc:
-            return web.json_response({"error": f"正则表达式有误: {exc}"}, status=400)
-        await self.manager.reload_all(force=True)
+            idx = int(request.match_info["idx"])
+        except ValueError:
+            return web.json_response({"error": "无效的规则序号"}, status=400)
+        data = await self._read_json(request)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            if idx < 0 or idx >= len(raw["rules"]):
+                return web.json_response({"error": "规则不存在"}, status=404)
+            default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
+            try:
+                raw["rules"][idx] = self._sanitize_rule_payload(data, default_acct)
+                save_raw_config(self.config_path, raw)
+            except ValueError as exc:
+                return web.json_response({"error": f"规则参数或正则有误: {exc}"}, status=400)
+            await self.manager.reload_all(force=True)
         return web.json_response({"ok": True, "rules": raw["rules"]})
 
     async def handle_rule_delete(self, request: web.Request) -> web.Response:
-        idx = int(request.match_info["idx"])
-        raw = load_raw_config(self.config_path)
-        if idx < 0 or idx >= len(raw["rules"]):
-            return web.json_response({"error": "规则不存在"}, status=404)
-        raw["rules"].pop(idx)
-        save_raw_config(self.config_path, raw)
-        await self.manager.reload_all(force=True)
+        try:
+            idx = int(request.match_info["idx"])
+        except ValueError:
+            return web.json_response({"error": "无效的规则序号"}, status=400)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            if idx < 0 or idx >= len(raw["rules"]):
+                return web.json_response({"error": "规则不存在"}, status=404)
+            raw["rules"].pop(idx)
+            save_raw_config(self.config_path, raw)
+            await self.manager.reload_all(force=True)
         return web.json_response({"ok": True, "rules": raw["rules"]})
 
     async def handle_rule_toggle(self, request: web.Request) -> web.Response:
-        idx = int(request.match_info["idx"])
-        raw = load_raw_config(self.config_path)
-        if idx < 0 or idx >= len(raw["rules"]):
-            return web.json_response({"error": "规则不存在"}, status=404)
-        raw["rules"][idx]["enabled"] = not bool(raw["rules"][idx].get("enabled", True))
-        save_raw_config(self.config_path, raw)
-        await self.manager.reload_all(force=True)
-        return web.json_response({"ok": True, "enabled": raw["rules"][idx]["enabled"]})
+        try:
+            idx = int(request.match_info["idx"])
+        except ValueError:
+            return web.json_response({"error": "无效的规则序号"}, status=400)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            if idx < 0 or idx >= len(raw["rules"]):
+                return web.json_response({"error": "规则不存在"}, status=404)
+            raw["rules"][idx]["enabled"] = not bool(raw["rules"][idx].get("enabled", True))
+            enabled = raw["rules"][idx]["enabled"]
+            save_raw_config(self.config_path, raw)
+            await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "enabled": enabled})
 
     async def handle_rule_test(self, request: web.Request) -> web.Response:
-        data = await request.json()
+        data = await self._read_json(request)
         sample = str(data.get("text") or "")
         strip_all_text = bool(data.get("strip_all_text", False))
         try:
@@ -549,7 +626,10 @@ class WebConsole:
                     "changed": bool(sample),
                 }
             )
-        cleaned, _, changed = clean_message_text(sample, None, compiled)
+        try:
+            cleaned, _, changed = clean_message_text(sample, None, compiled)
+        except ValueError as exc:
+            return web.json_response({"error": f"替换模板错误: {exc}"}, status=400)
         return web.json_response(
             {
                 "skipped": skip_reason is not None,
@@ -586,43 +666,52 @@ class WebConsole:
         )
 
     async def handle_settings_put(self, request: web.Request) -> web.Response:
-        data = await request.json()
-        raw = load_raw_config(self.config_path)
-        g = raw.setdefault("global", {})
+        data = await self._read_json(request)
+        try:
+            delay_val = max(0.0, self._parse_float(data.get("delay_seconds"), "delay_seconds", default=1.0)) if "delay_seconds" in data else None
+            max_mb_val = max(1, self._parse_int(data.get("max_download_mb"), "max_download_mb", default=2000)) if "max_download_mb" in data else None
+            ttl_val = max(1, self._parse_int(data.get("dedup_ttl_hours"), "dedup_ttl_hours", default=48)) if "dedup_ttl_hours" in data else None
+            cw_val = max(5, min(300, self._parse_int(data.get("comment_wait_seconds"), "comment_wait_seconds", default=30))) if "comment_wait_seconds" in data else None
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
-        if "delay_seconds" in data:
-            g["delay_seconds"] = max(0.0, float(data.get("delay_seconds", 1.0)))
-        if "max_download_mb" in data:
-            g["max_download_mb"] = max(1, int(data.get("max_download_mb", 2000)))
-        if "dedup_ttl_hours" in data:
-            g["dedup_ttl_hours"] = max(1, int(data.get("dedup_ttl_hours", 48)))
-        if "comment_wait_seconds" in data:
-            g["comment_wait_seconds"] = max(5, min(300, int(data.get("comment_wait_seconds") or 30)))
-        if "comment_merge_mode" in data:
-            g["comment_merge_mode"] = (
-                "keep_batches" if str(data.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
-            )
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            g = raw.setdefault("global", {})
 
-        if data.get("reset_api"):
-            g.pop("api_id", None)
-            g.pop("api_hash", None)
-        else:
-            if "api_id" in data and str(data["api_id"]).strip():
-                try:
-                    aid = int(str(data["api_id"]).strip())
-                    if aid <= 0:
-                        raise ValueError("API ID 必须为正整数")
-                    g["api_id"] = aid
-                except ValueError:
-                    return web.json_response({"error": "API ID 必须是正整数"}, status=400)
-            if "api_hash" in data and str(data["api_hash"]).strip():
-                ah = str(data["api_hash"]).strip()
-                if len(ah) < 16:
-                    return web.json_response({"error": "API Hash 格式看起来过短，请核对"}, status=400)
-                g["api_hash"] = ah
+            if delay_val is not None:
+                g["delay_seconds"] = delay_val
+            if max_mb_val is not None:
+                g["max_download_mb"] = max_mb_val
+            if ttl_val is not None:
+                g["dedup_ttl_hours"] = ttl_val
+            if cw_val is not None:
+                g["comment_wait_seconds"] = cw_val
+            if "comment_merge_mode" in data:
+                g["comment_merge_mode"] = (
+                    "keep_batches" if str(data.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
+                )
 
-        save_raw_config(self.config_path, raw)
-        await self.manager.reload_all(force=True)
+            if data.get("reset_api"):
+                g.pop("api_id", None)
+                g.pop("api_hash", None)
+            else:
+                if "api_id" in data and str(data["api_id"]).strip():
+                    try:
+                        aid = int(str(data["api_id"]).strip())
+                        if aid <= 0:
+                            raise ValueError("API ID 必须为正整数")
+                        g["api_id"] = aid
+                    except ValueError:
+                        return web.json_response({"error": "API ID 必须是正整数"}, status=400)
+                if "api_hash" in data and str(data["api_hash"]).strip():
+                    ah = str(data["api_hash"]).strip()
+                    if len(ah) < 16:
+                        return web.json_response({"error": "API Hash 格式看起来过短，请核对"}, status=400)
+                    g["api_hash"] = ah
+
+            save_raw_config(self.config_path, raw)
+            await self.manager.reload_all(force=True)
         return web.json_response({"ok": True})
 
     async def handle_token_rotate(self, _request: web.Request) -> web.Response:
@@ -670,18 +759,20 @@ class WebConsole:
             self._qr_states[acct_id] = {"status": "error", "qr_data_url": "", "error": str(exc)}
 
     async def handle_tg_qr_start(self, request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        body = await self._read_json(request, allow_empty=True)
         acct_id = str(body.get("account_id") or request.query.get("account_id") or "default").strip() or "default"
         runner = self._resolve_runner_or_404(acct_id)
+        if not runner.enabled:
+            return web.json_response({"error": "该账号已停用，请先启用后再登录"}, status=400)
         if await runner.ensure_authorized(verify_live=True):
             return web.json_response({"status": "authorized"})
         old_task = self._qr_tasks.get(acct_id)
         if old_task and not old_task.done():
             old_task.cancel()
-        qr_obj = await runner.client.qr_login()
+        try:
+            qr_obj = await runner.client.qr_login()
+        except Exception as exc:
+            return web.json_response({"error": f"生成二维码失败: {exc}"}, status=400)
         self._qr_objs[acct_id] = qr_obj
         data_url = self._qr_to_data_url(qr_obj.url)
         st = {"status": "waiting", "qr_data_url": data_url, "error": ""}
@@ -692,7 +783,7 @@ class WebConsole:
     async def handle_tg_qr_poll(self, request: web.Request) -> web.Response:
         acct_id = request.query.get("account_id", "default").strip() or "default"
         runner = self._resolve_runner_or_404(acct_id)
-        if await runner.client.is_user_authorized():
+        if await runner.ensure_authorized(verify_live=False):
             if not runner.listening:
                 await runner.on_user_authorized()
             return web.json_response({"status": "authorized", "error": ""})
@@ -700,16 +791,19 @@ class WebConsole:
         return web.json_response({"status": st.get("status", "idle"), "error": st.get("error", "")})
 
     async def handle_tg_qr_2fa(self, request: web.Request) -> web.Response:
-        data = await request.json()
+        data = await self._read_json(request)
         acct_id = str(data.get("account_id") or "default").strip() or "default"
         pwd = str(data.get("password") or "")
         runner = self._resolve_runner_or_404(acct_id)
         if not pwd:
-            return web.json_response({"error": "请输入两步验证密码"}, status=400)
+            return web.json_response({"error": "请输入两步验证（2FA）云密码"}, status=400)
         try:
+            if not runner.client.is_connected():
+                await runner.client.connect()
             await runner.client.sign_in(password=pwd)
             if runner.session_file.exists():
                 os.chmod(runner.session_file, 0o600)
+            self._qr_objs.pop(acct_id, None)
             self._qr_states[acct_id] = {"status": "authorized", "qr_data_url": "", "error": ""}
             await runner.on_user_authorized()
             return web.json_response({"status": "authorized"})
@@ -717,68 +811,79 @@ class WebConsole:
             return web.json_response({"error": f"两步验证失败: {exc}"}, status=400)
 
     async def handle_tg_phone_send(self, request: web.Request) -> web.Response:
-        data = await request.json()
+        data = await self._read_json(request)
         acct_id = str(data.get("account_id") or "default").strip() or "default"
         phone = str(data.get("phone") or "").strip()
         runner = self._resolve_runner_or_404(acct_id)
+        if not runner.enabled:
+            return web.json_response({"error": "该账号已停用，请先启用后再登录"}, status=400)
         if not phone:
             return web.json_response({"error": "请填写带国际区号的手机号（如 +86...）"}, status=400)
         if not runner.client.is_connected():
             await runner.client.connect()
         try:
             res = await runner.client.send_code_request(phone)
-            self._phone_states[acct_id] = (phone, res.phone_code_hash)
+            self._phone_states[acct_id] = {"phone": phone, "hash": res.phone_code_hash, "need_2fa": False}
             return web.json_response({"ok": True})
         except Exception as exc:
             return web.json_response({"error": f"发送验证码失败: {exc}"}, status=400)
 
     async def handle_tg_phone_verify(self, request: web.Request) -> web.Response:
-        data = await request.json()
+        data = await self._read_json(request)
         acct_id = str(data.get("account_id") or "default").strip() or "default"
         code = str(data.get("code") or "").strip()
         password = str(data.get("password") or "")
         runner = self._resolve_runner_or_404(acct_id)
         phone_state = self._phone_states.get(acct_id)
         if not phone_state:
-            return web.json_response({"error": "请先发送验证码"}, status=400)
-        phone, phone_code_hash = phone_state
+            return web.json_response({"error": "请先发送登录验证码"}, status=400)
+        phone = phone_state["phone"]
+        phone_code_hash = phone_state["hash"]
         try:
-            try:
-                await runner.client.sign_in(
-                    phone=phone,
-                    code=code,
-                    phone_code_hash=phone_code_hash,
-                )
-            except SessionPasswordNeededError:
+            if not runner.client.is_connected():
+                await runner.client.connect()
+            if phone_state.get("need_2fa"):
                 if not password:
-                    return web.json_response({"need_2fa": True, "error": "该账号启用了两步验证，请输入 2FA 密码"}, status=200)
+                    return web.json_response(
+                        {"need_2fa": True, "error": "请输入该账号的两步验证（2FA）固定云密码"}, status=200
+                    )
                 await runner.client.sign_in(password=password)
+            else:
+                if not code:
+                    return web.json_response({"error": "请输入 Telegram 收到的登录验证码"}, status=400)
+                try:
+                    await runner.client.sign_in(
+                        phone=phone,
+                        code=code,
+                        phone_code_hash=phone_code_hash,
+                    )
+                except SessionPasswordNeededError:
+                    phone_state["need_2fa"] = True
+                    if not password:
+                        return web.json_response(
+                            {"need_2fa": True, "error": "验证码已通过，请输入两步验证（2FA）固定云密码"}, status=200
+                        )
+                    await runner.client.sign_in(password=password)
+            self._phone_states.pop(acct_id, None)
             if runner.session_file.exists():
                 os.chmod(runner.session_file, 0o600)
             await runner.on_user_authorized()
             return web.json_response({"ok": True, "status": "authorized"})
         except (PhoneCodeInvalidError, PhoneCodeExpiredError) as exc:
-            return web.json_response({"error": f"验证码无效或已过期: {exc}"}, status=400)
+            return web.json_response({"error": f"登录验证码无效或已过期: {exc}"}, status=400)
         except Exception as exc:
             return web.json_response({"error": f"登录失败: {exc}"}, status=400)
 
     async def handle_tg_logout(self, request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        body = await self._read_json(request, allow_empty=True)
         acct_id = str(body.get("account_id") or request.query.get("account_id") or "default").strip() or "default"
         runner = self._resolve_runner_or_404(acct_id)
         task = self._qr_tasks.pop(acct_id, None)
         if task and not task.done():
             task.cancel()
-        try:
-            if await runner.client.is_user_authorized():
-                await runner.client.log_out()
-        except Exception as exc:
-            log.warning("Logout warning for %s: %s", acct_id, exc)
-        runner.listening = False
-        runner.chats_cache = []
+        self._qr_objs.pop(acct_id, None)
+        self._phone_states.pop(acct_id, None)
+        await runner.logout()
         self._qr_states[acct_id] = {"status": "idle", "qr_data_url": "", "error": ""}
         return web.json_response({"ok": True})
 

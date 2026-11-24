@@ -7,10 +7,11 @@ import qrcode
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
-from common import load_env_file
+from common import load_env_file, load_raw_config, resolve_tg_api
 
 BASE_DIR = Path(os.environ.get("TG_FWD_DIR") or Path(__file__).resolve().parent)
 ENV_PATH = BASE_DIR / ".env"
+CONFIG_PATH = BASE_DIR / "config.yaml"
 SESSION_DIR = BASE_DIR / "session"
 SESSION_PATH = SESSION_DIR / "userbot"
 QR_PNG_PATH = BASE_DIR / "cache" / "login_qr.png"
@@ -47,8 +48,10 @@ async def main() -> None:
     args = parser.parse_args()
 
     load_env_file(ENV_PATH)
-    api_id = int(os.environ["TELEGRAM_API_ID"])
-    api_hash = os.environ["TELEGRAM_API_HASH"]
+    api_id, api_hash, _ = resolve_tg_api(load_raw_config(CONFIG_PATH))
+    if not api_id or not api_hash:
+        print("缺少 TELEGRAM_API_ID / TELEGRAM_API_HASH，请先在 .env 或 config.yaml 中配置")
+        return
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(SESSION_DIR, 0o700)
 
@@ -56,9 +59,10 @@ async def main() -> None:
     await client.connect()
     if await client.is_user_authorized():
         me = await client.get_me()
-        print(f"已经登录过啦: {me.first_name} (@{me.username}, id={me.id})")
-        await client.disconnect()
-        return
+        if me is not None:
+            print(f"已经登录过啦: {me.first_name} (@{me.username}, id={me.id})")
+            await client.disconnect()
+            return
 
     if args.qr:
         await qr_login(client)
