@@ -90,6 +90,9 @@ class AppConfig:
     log_max_rows: int = 5000
 
 
+REGEX_KINDS = ("skip", "strip_text", "strip", "replace")
+
+
 def _compile_patterns(items: Sequence[str] | None, field_name: str) -> list[re.Pattern[str]]:
     compiled: list[re.Pattern[str]] = []
     for pat in items or []:
@@ -112,18 +115,121 @@ def _validate_replace_template(rx: re.Pattern[str], repl: str) -> None:
             raise ValueError(f"Invalid replacement template {repl!r}: {exc}") from exc
 
 
+def validate_regex_rule_dict(rx: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(rx, dict):
+        raise ValueError("正则条目格式无效")
+    rx_id = str(rx.get("id") or "").strip() or ("rx_" + secrets.token_hex(4))
+    name = str(rx.get("name") or "").strip()
+    if not name:
+        raise ValueError("请填写正则名称")
+    kind = str(rx.get("kind") or "").strip()
+    if kind not in REGEX_KINDS:
+        raise ValueError(f"无效的正则类型: {kind!r}")
+    note = str(rx.get("note") or "").strip()
+
+    if kind == "replace":
+        replaces: list[dict[str, str]] = []
+        for rep in rx.get("replace_patterns") or []:
+            if not isinstance(rep, dict):
+                continue
+            pat = str(rep.get("pattern") or "").strip()
+            if not pat:
+                continue
+            repl = str(rep.get("repl", ""))
+            try:
+                compiled = re.compile(pat, re.MULTILINE)
+            except re.error as exc:
+                raise ValueError(f"Invalid replace regex in {name}: {pat!r} ({exc})") from exc
+            _validate_replace_template(compiled, repl)
+            replaces.append({"pattern": pat, "repl": repl})
+        if not replaces:
+            raise ValueError(f"正则「{name}」至少需要一条替换规则")
+        out: dict[str, Any] = {
+            "id": rx_id,
+            "name": name,
+            "kind": kind,
+            "replace_patterns": replaces,
+        }
+        if note:
+            out["note"] = note
+        return out
+
+    patterns = [str(p).strip() for p in (rx.get("patterns") or []) if str(p).strip()]
+    if not patterns:
+        raise ValueError(f"正则「{name}」至少需要一条正则表达式")
+    _compile_patterns(patterns, f"regex.{name}")
+    out = {
+        "id": rx_id,
+        "name": name,
+        "kind": kind,
+        "patterns": patterns,
+    }
+    if note:
+        out["note"] = note
+    return out
+
+
+def build_regex_map(regex_rules: Sequence[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for rx in regex_rules or []:
+        if isinstance(rx, dict) and rx.get("id"):
+            out[str(rx["id"]).strip()] = rx
+    return out
+
+
+def resolve_rule_patterns(
+    r: dict[str, Any],
+    regex_map: Optional[dict[str, dict[str, Any]]] = None,
+) -> tuple[list[str], list[str], list[str], list[dict[str, str]]]:
+    skip_pats: list[str] = []
+    strip_text_pats: list[str] = []
+    strip_pats: list[str] = []
+    replace_pats: list[dict[str, str]] = []
+
+    if regex_map:
+        seen_ids: set[str] = set()
+        for raw_id in r.get("regex_ids") or []:
+            rx_id = str(raw_id).strip()
+            if not rx_id or rx_id in seen_ids:
+                continue
+            seen_ids.add(rx_id)
+            rx = regex_map.get(rx_id)
+            if not rx:
+                continue
+            kind = str(rx.get("kind") or "").strip()
+            if kind == "skip":
+                skip_pats.extend(str(p) for p in (rx.get("patterns") or []) if str(p).strip())
+            elif kind == "strip_text":
+                strip_text_pats.extend(str(p) for p in (rx.get("patterns") or []) if str(p).strip())
+            elif kind == "strip":
+                strip_pats.extend(str(p) for p in (rx.get("patterns") or []) if str(p).strip())
+            elif kind == "replace":
+                for rep in rx.get("replace_patterns") or []:
+                    if isinstance(rep, dict) and str(rep.get("pattern") or "").strip():
+                        replace_pats.append({"pattern": str(rep["pattern"]), "repl": str(rep.get("repl", ""))})
+
+    skip_pats.extend(str(p) for p in (r.get("skip_patterns") or []) if str(p).strip())
+    strip_text_pats.extend(str(p) for p in (r.get("strip_text_patterns") or []) if str(p).strip())
+    strip_pats.extend(str(p) for p in (r.get("strip_patterns") or []) if str(p).strip())
+    for rep in r.get("replace_patterns") or []:
+        if isinstance(rep, dict) and str(rep.get("pattern") or "").strip():
+            replace_pats.append({"pattern": str(rep["pattern"]), "repl": str(rep.get("repl", ""))})
+
+    return skip_pats, strip_text_pats, strip_pats, replace_pats
+
+
 def compile_rule_dict(
     r: dict[str, Any],
     idx: int = 0,
     default_comment_wait: int = 30,
     default_comment_mode: str = "pack",
+    regex_map: Optional[dict[str, dict[str, Any]]] = None,
 ) -> CompiledRule:
     name = str(r.get("name") or f"rule-{idx + 1}")
     account_id = str(r.get("account_id") or "default").strip() or "default"
+    skip_pats, strip_text_pats, strip_pats, raw_replaces = resolve_rule_patterns(r, regex_map=regex_map)
     replaces: list[CompiledReplace] = []
-    for rep in r.get("replace_patterns") or []:
-        if not isinstance(rep, dict):
-            continue
+    for rep in raw_replaces:
         pat = str(rep.get("pattern") or "")
         if not pat:
             continue
@@ -155,9 +261,9 @@ def compile_rule_dict(
         collect_comments=bool(r.get("collect_comments", False)),
         comment_wait_seconds=cw,
         comment_merge_mode=cm,
-        skip_patterns=_compile_patterns(r.get("skip_patterns"), f"{name}.skip_patterns"),
-        strip_text_patterns=_compile_patterns(r.get("strip_text_patterns"), f"{name}.strip_text_patterns"),
-        strip_patterns=_compile_patterns(r.get("strip_patterns"), f"{name}.strip_patterns"),
+        skip_patterns=_compile_patterns(skip_pats, f"{name}.skip_patterns"),
+        strip_text_patterns=_compile_patterns(strip_text_pats, f"{name}.strip_text_patterns"),
+        strip_patterns=_compile_patterns(strip_pats, f"{name}.strip_patterns"),
         replace_patterns=replaces,
     )
 
@@ -168,6 +274,7 @@ def load_raw_config(config_path: Path) -> dict[str, Any]:
     else:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     raw.setdefault("global", {})
+    raw.setdefault("regex_rules", [])
     if not raw.get("accounts"):
         raw["accounts"] = [{"id": "default", "name": "默认账号", "enabled": True}]
     rules = raw.get("rules") or []
@@ -179,8 +286,13 @@ def load_raw_config(config_path: Path) -> dict[str, Any]:
 
 
 def save_raw_config(config_path: Path, data: dict[str, Any]) -> None:
+    regex_rules = data.get("regex_rules") or []
+    validated_regex = [validate_regex_rule_dict(rx) for rx in regex_rules]
+    if "regex_rules" in data or validated_regex:
+        data["regex_rules"] = validated_regex
+    regex_map = build_regex_map(validated_regex)
     for idx, r in enumerate(data.get("rules") or []):
-        compile_rule_dict(r, idx)
+        compile_rule_dict(r, idx, regex_map=regex_map)
     tmp_path = config_path.with_name(f".{config_path.name}.{secrets.token_hex(4)}.tmp")
     text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, indent=2)
     try:
@@ -217,8 +329,9 @@ def load_config(config_path: Path) -> AppConfig:
     ]
     default_cw = max(5, min(300, int(g.get("comment_wait_seconds", 30) or 30)))
     default_cm = "keep_batches" if str(g.get("comment_merge_mode") or "").strip() == "keep_batches" else "pack"
+    regex_map = build_regex_map(raw.get("regex_rules") or [])
     rules_out = [
-        compile_rule_dict(r, idx, default_comment_wait=default_cw, default_comment_mode=default_cm)
+        compile_rule_dict(r, idx, default_comment_wait=default_cw, default_comment_mode=default_cm, regex_map=regex_map)
         for idx, r in enumerate(raw.get("rules") or [])
     ]
     return AppConfig(

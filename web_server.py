@@ -15,14 +15,17 @@ from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, Sessio
 
 from common import (
     AuthStore,
+    build_regex_map,
     clean_message_text,
     compile_rule_dict,
     load_raw_config,
+    resolve_rule_patterns,
     resolve_tg_api,
     save_raw_config,
     session_prefix_for,
     should_skip_text,
     should_strip_all_text,
+    validate_regex_rule_dict,
 )
 
 log = logging.getLogger("tg-forwarder.web")
@@ -327,10 +330,83 @@ class WebConsole:
             await self.manager.reload_all(force=True)
         return web.json_response({"ok": True, "items": await self._all_accounts_summary()})
 
+    @staticmethod
+    def _regex_rules_with_usage(raw: dict[str, Any]) -> list[dict[str, Any]]:
+        rules = raw.get("rules") or []
+        usage: dict[str, list[str]] = {}
+        for idx, r in enumerate(rules):
+            r_name = str(r.get("name") or f"rule-{idx + 1}")
+            for raw_id in r.get("regex_ids") or []:
+                rx_id = str(raw_id).strip()
+                if rx_id:
+                    usage.setdefault(rx_id, []).append(r_name)
+        items: list[dict[str, Any]] = []
+        for rx in raw.get("regex_rules") or []:
+            if not isinstance(rx, dict):
+                continue
+            rx_id = str(rx.get("id") or "").strip()
+            items.append({**rx, "used_by": usage.get(rx_id, [])})
+        return items
+
+    async def handle_regex_list(self, _request: web.Request) -> web.Response:
+        raw = load_raw_config(self.config_path)
+        return web.json_response({"items": self._regex_rules_with_usage(raw)})
+
+    async def handle_regex_create(self, request: web.Request) -> web.Response:
+        data = await self._read_json(request)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            payload = dict(data)
+            payload.pop("id", None)
+            try:
+                rx = validate_regex_rule_dict(payload)
+                raw.setdefault("regex_rules", []).append(rx)
+                save_raw_config(self.config_path, raw)
+            except ValueError as exc:
+                return web.json_response({"error": f"正则配置有误: {exc}"}, status=400)
+            await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "id": rx["id"], "items": self._regex_rules_with_usage(raw)})
+
+    async def handle_regex_update(self, request: web.Request) -> web.Response:
+        rx_id = str(request.match_info["rx_id"] or "").strip()
+        data = await self._read_json(request)
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            items = raw.setdefault("regex_rules", [])
+            target_idx = next((i for i, x in enumerate(items) if str(x.get("id") or "") == rx_id), -1)
+            if target_idx < 0:
+                return web.json_response({"error": "正则规则不存在"}, status=404)
+            payload = dict(data)
+            payload["id"] = rx_id
+            try:
+                items[target_idx] = validate_regex_rule_dict(payload)
+                save_raw_config(self.config_path, raw)
+            except ValueError as exc:
+                return web.json_response({"error": f"正则配置有误: {exc}"}, status=400)
+            await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "items": self._regex_rules_with_usage(raw)})
+
+    async def handle_regex_delete(self, request: web.Request) -> web.Response:
+        rx_id = str(request.match_info["rx_id"] or "").strip()
+        async with self._config_lock:
+            raw = load_raw_config(self.config_path)
+            items = raw.setdefault("regex_rules", [])
+            new_items = [x for x in items if str(x.get("id") or "") != rx_id]
+            if len(new_items) == len(items):
+                return web.json_response({"error": "正则规则不存在"}, status=404)
+            raw["regex_rules"] = new_items
+            for r in raw.get("rules") or []:
+                if r.get("regex_ids"):
+                    r["regex_ids"] = [x for x in r["regex_ids"] if str(x).strip() != rx_id]
+            save_raw_config(self.config_path, raw)
+            await self.manager.reload_all(force=True)
+        return web.json_response({"ok": True, "items": self._regex_rules_with_usage(raw)})
+
     async def handle_overview(self, _request: web.Request) -> web.Response:
         raw = load_raw_config(self.config_path)
         rules = raw.get("rules") or []
         enabled_rules = [r for r in rules if r.get("enabled", True)]
+        regex_map = build_regex_map(raw.get("regex_rules") or [])
         accounts = await self._all_accounts_summary()
         acct_name_map = {a["id"]: a["name"] for a in accounts}
 
@@ -348,6 +424,10 @@ class WebConsole:
         resolved_sources = sum(len(r.source_map) for r in self.manager.runners.values())
         authorized_accounts = sum(1 for a in accounts if a["authorized"])
         listening_accounts = sum(1 for a in accounts if a["listening"])
+
+        def _filters_count(r: dict[str, Any]) -> int:
+            sp, stp, srp, rep = resolve_rule_patterns(r, regex_map=regex_map)
+            return len(sp) + len(stp) + len(srp) + len(rep)
 
         return web.json_response(
             {
@@ -376,10 +456,7 @@ class WebConsole:
                         "skip_text_only": bool(r.get("skip_text_only", False)),
                         "strip_all_text": bool(r.get("strip_all_text", False)),
                         "fallback_reupload": bool(r.get("fallback_reupload", True)),
-                        "filters_count": len(r.get("skip_patterns") or [])
-                        + len(r.get("strip_text_patterns") or [])
-                        + len(r.get("strip_patterns") or [])
-                        + len(r.get("replace_patterns") or []),
+                        "filters_count": _filters_count(r),
                     }
                     for r in enabled_rules[:6]
                 ],
@@ -489,6 +566,7 @@ class WebConsole:
         return web.json_response(
             {
                 "rules": rules,
+                "regex_rules": self._regex_rules_with_usage(raw),
                 "accounts": accounts,
                 "chat_titles": self.manager.all_chat_titles(),
                 "global_defaults": {
@@ -501,7 +579,11 @@ class WebConsole:
         )
 
     @staticmethod
-    def _sanitize_rule_payload(data: dict[str, Any], default_acct: str = "default") -> dict[str, Any]:
+    def _sanitize_rule_payload(
+        data: dict[str, Any],
+        default_acct: str = "default",
+        valid_regex_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
         def _clean_peers(items: Any) -> list[int | str]:
             out: list[int | str] = []
             for item in items or []:
@@ -519,9 +601,22 @@ class WebConsole:
 
         replaces = []
         for rep in data.get("replace_patterns") or []:
+            if not isinstance(rep, dict):
+                continue
             pat = str(rep.get("pattern") or "").strip()
             if pat:
                 replaces.append({"pattern": pat, "repl": str(rep.get("repl") or "")})
+
+        regex_ids: list[str] = []
+        seen_rx: set[str] = set()
+        for raw_id in data.get("regex_ids") or []:
+            rid = str(raw_id).strip()
+            if not rid or rid in seen_rx:
+                continue
+            if valid_regex_ids is not None and rid not in valid_regex_ids:
+                continue
+            seen_rx.add(rid)
+            regex_ids.append(rid)
 
         rule_dict: dict[str, Any] = {
             "name": str(data.get("name") or "").strip() or "未命名规则",
@@ -536,11 +631,20 @@ class WebConsole:
             "skip_empty_text_only": bool(data.get("skip_empty_text_only", True)),
             "disable_link_preview": bool(data.get("disable_link_preview", False)),
             "collect_comments": bool(data.get("collect_comments", False)),
-            "skip_patterns": _clean_patterns(data.get("skip_patterns")),
-            "strip_text_patterns": _clean_patterns(data.get("strip_text_patterns")),
-            "strip_patterns": _clean_patterns(data.get("strip_patterns")),
-            "replace_patterns": replaces,
+            "regex_ids": regex_ids,
         }
+        skip_p = _clean_patterns(data.get("skip_patterns"))
+        strip_text_p = _clean_patterns(data.get("strip_text_patterns"))
+        strip_p = _clean_patterns(data.get("strip_patterns"))
+        if skip_p:
+            rule_dict["skip_patterns"] = skip_p
+        if strip_text_p:
+            rule_dict["strip_text_patterns"] = strip_text_p
+        if strip_p:
+            rule_dict["strip_patterns"] = strip_p
+        if replaces:
+            rule_dict["replace_patterns"] = replaces
+
         raw_cw = data.get("comment_wait_seconds")
         if raw_cw not in (None, ""):
             rule_dict["comment_wait_seconds"] = max(5, min(300, WebConsole._parse_int(raw_cw, "comment_wait_seconds")))
@@ -554,8 +658,9 @@ class WebConsole:
         async with self._config_lock:
             raw = load_raw_config(self.config_path)
             default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
+            valid_rx = {str(x["id"]) for x in (raw.get("regex_rules") or []) if isinstance(x, dict) and x.get("id")}
             try:
-                rule = self._sanitize_rule_payload(data, default_acct)
+                rule = self._sanitize_rule_payload(data, default_acct, valid_regex_ids=valid_rx)
                 raw["rules"].append(rule)
                 save_raw_config(self.config_path, raw)
             except ValueError as exc:
@@ -574,8 +679,9 @@ class WebConsole:
             if idx < 0 or idx >= len(raw["rules"]):
                 return web.json_response({"error": "规则不存在"}, status=404)
             default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
+            valid_rx = {str(x["id"]) for x in (raw.get("regex_rules") or []) if isinstance(x, dict) and x.get("id")}
             try:
-                raw["rules"][idx] = self._sanitize_rule_payload(data, default_acct)
+                raw["rules"][idx] = self._sanitize_rule_payload(data, default_acct, valid_regex_ids=valid_rx)
                 save_raw_config(self.config_path, raw)
             except ValueError as exc:
                 return web.json_response({"error": f"规则参数或正则有误: {exc}"}, status=400)
@@ -615,16 +721,20 @@ class WebConsole:
         data = await self._read_json(request)
         sample = str(data.get("text") or "")
         strip_all_text = bool(data.get("strip_all_text", False))
+        raw = load_raw_config(self.config_path)
+        regex_map = build_regex_map(raw.get("regex_rules") or [])
         try:
             compiled = compile_rule_dict(
                 {
                     "name": "preview",
                     "strip_all_text": strip_all_text,
+                    "regex_ids": data.get("regex_ids") or [],
                     "skip_patterns": data.get("skip_patterns") or [],
                     "strip_text_patterns": data.get("strip_text_patterns") or [],
                     "strip_patterns": data.get("strip_patterns") or [],
                     "replace_patterns": data.get("replace_patterns") or [],
-                }
+                },
+                regex_map=regex_map,
             )
         except ValueError as exc:
             return web.json_response({"error": f"正则表达式错误: {exc}"}, status=400)
@@ -967,6 +1077,11 @@ class WebConsole:
         app.router.add_delete("/api/rules/{idx}", self.handle_rule_delete)
         app.router.add_post("/api/rules/{idx}/toggle", self.handle_rule_toggle)
         app.router.add_post("/api/rules/test", self.handle_rule_test)
+
+        app.router.add_get("/api/regex", self.handle_regex_list)
+        app.router.add_post("/api/regex", self.handle_regex_create)
+        app.router.add_put("/api/regex/{rx_id}", self.handle_regex_update)
+        app.router.add_delete("/api/regex/{rx_id}", self.handle_regex_delete)
 
         app.router.add_get("/api/settings", self.handle_settings_get)
         app.router.add_put("/api/settings", self.handle_settings_put)

@@ -7,6 +7,10 @@
     overview: null,
     logs: { items: [], rules: [], accounts: [], status: '', rule: '', account_id: '', page: 1, pageSize: 30, total: 0, totalPages: 1 },
     rules: [],
+    regexRules: [],
+    regexFilterKind: '',
+    regexSearch: '',
+    expandedRuleSources: {},
     accounts: [],
     ruleFilterAccount: '',
     chatTitles: {},
@@ -25,24 +29,37 @@
     logManage: null,
     resendingIds: {},
     modalRule: null, // null | { idx, data, chats }
+    modalRuleTestOpen: false,
+    modalRuleRxFilter: '',
     modalPickerQuery: '',
+    modalRegex: null, // null | { id, data, genOpen, genStripMode, genWords, genIgnoreCase }
     modalPassword: false,
     modalAddAccount: false,
     testInput: '🔥频道推荐内容\n这是一段正文，包含重要信息\n\n关注备用频道 @example_ad_channel',
     testOutput: null,
-    regexGen: {
-      mode: 'strip_line',
-      words: '关注频道\n备用频道\n投稿联系',
-      ignoreCase: true,
-      out: '(?im)^.*(?:关注频道|备用频道|投稿联系).*$',
+    regexTest: {
+      selectedIds: [],
       sample: '🔥精品分享\n这是一段正文内容\n关注备用频道 @example_ad\n广告合作请联系 @someone',
-      skip: '(?i)#ad\\b|广告合作|商务联系',
-      stripAll: '',
-      strip: '(?im)^.*(?:关注频道|备用频道|投稿联系).*$',
-      replace: '',
       result: null,
     },
   };
+
+  const REGEX_KIND_META = {
+    skip: { label: '整条跳过', short: '跳过', badge: 'warning', desc: '命中即拦截整条消息（含媒体）' },
+    strip_text: { label: '命中清文', short: '清文', badge: 'violet', desc: '命中即清空全部配文，仅发媒体' },
+    strip: { label: '删除文本', short: '删除', badge: 'info', desc: '删除匹配词或整行，保留正文格式' },
+    replace: { label: '查找替换', short: '替换', badge: 'success', desc: '按 查找正则 => 替换为 执行替换' },
+  };
+  const REGEX_KIND_ORDER = ['skip', 'strip_text', 'strip', 'replace'];
+
+  const REGEX_TEMPLATES = [
+    { name: '拦截常见广告与推广', kind: 'skip', desc: '整条消息命中关键词即跳过', patterns: ['(?i)#ad\\b|广告合作|商务联系|推广'] },
+    { name: '拦截外部网址帖', kind: 'skip', desc: '含 http 链接但放行 t.me', patterns: ['(?i)https?://(?!t\\.me/)'] },
+    { name: '删除含关键词的宣传整行', kind: 'strip', desc: '删掉含“关注频道/备用频道/投稿联系”的整行', patterns: ['(?im)^.*(?:关注频道|备用频道|投稿联系).*$'] },
+    { name: '删除所有 @用户名', kind: 'strip', desc: '清空文内或末尾的 @xxx 提及', patterns: ['@\\w+'] },
+    { name: '删除 t.me 频道链接', kind: 'strip', desc: '移除 https://t.me/xxx 尾巴', patterns: ['(?i)https?://t\\.me/\\S+'] },
+    { name: '删除所有 #话题标签', kind: 'strip', desc: '移除 #标签1 #标签2', patterns: ['#[\\w\\u4e00-\\u9fff]+'] },
+  ];
 
   function esc(v) {
     return String(v == null ? '' : v)
@@ -174,6 +191,35 @@
     return t ? `${esc(t)} <span class="mono muted">(${esc(s)})</span>` : `<span class="mono">${esc(s)}</span>`;
   }
 
+  function peerShortName(id) {
+    const s = String(id);
+    return state.chatTitles[s] || s;
+  }
+
+  function peerTooltip(id) {
+    const s = String(id);
+    const t = state.chatTitles[s];
+    return t ? `${t} (${s})` : s;
+  }
+
+  function regexContentText(rx) {
+    if (!rx) return '';
+    if (rx.kind === 'replace') {
+      return (rx.replace_patterns || []).map((p) => `${p.pattern} => ${p.repl || ''}`).join('\n');
+    }
+    return (rx.patterns || []).join('\n');
+  }
+
+  function regexPreviewLine(rx) {
+    const lines = regexContentText(rx).split('\n').filter(Boolean);
+    if (!lines.length) return '';
+    return lines.length > 1 ? `${lines[0]} (+${lines.length - 1}行)` : lines[0];
+  }
+
+  function getRegexById(id) {
+    return (state.regexRules || []).find((x) => x.id === id) || null;
+  }
+
   function navigate(path) {
     state.route = path;
     state.sidebarOpen = false;
@@ -216,9 +262,18 @@
       } else if (path === '/rules') {
         const d = await api('/api/rules');
         state.rules = d.rules || [];
+        state.regexRules = d.regex_rules || [];
         state.accounts = d.accounts || [];
         state.chatTitles = d.chat_titles || {};
         if (d.global_defaults) state.ruleGlobalDefaults = d.global_defaults;
+      } else if (path === '/regex') {
+        const d = await api('/api/regex');
+        state.regexRules = d.items || [];
+        const validSet = new Set(state.regexRules.map((x) => x.id));
+        state.regexTest.selectedIds = (state.regexTest.selectedIds || []).filter((id) => validSet.has(id));
+        if (!state.regexTest.selectedIds.length && state.regexRules.length) {
+          state.regexTest.selectedIds = state.regexRules.slice(0, 2).map((x) => x.id);
+        }
       } else if (path === '/chats') {
         const accts = await api('/api/accounts');
         state.accounts = accts.items || [];
@@ -670,13 +725,87 @@
       .map((r, idx) => ({ r, idx }))
       .filter(({ r }) => !state.ruleFilterAccount || (r.account_id || 'default') === state.ruleFilterAccount);
 
+    const renderSourcePills = (sources, idx) => {
+      const list = sources || [];
+      if (!list.length) return '<span class="hint">未设置源频道</span>';
+      const limit = 6;
+      const expanded = !!state.expandedRuleSources[idx];
+      const visible = expanded || list.length <= limit ? list : list.slice(0, limit);
+      const pills = visible
+        .map(
+          (id) =>
+            `<span class="channel-pill" title="${esc(peerTooltip(id))}"><span class="channel-pill-text">${esc(peerShortName(id))}</span></span>`
+        )
+        .join('');
+      const more =
+        list.length > limit
+          ? `<button type="button" class="link-toggle-btn" data-toggle-sources="${idx}">${expanded ? '收起' : `+${list.length - limit} 更多`}</button>`
+          : '';
+      return `<div class="channel-pill-list">${pills}</div>${more ? `<div style="margin-top:2px">${more}</div>` : ''}`;
+    };
+
+    const renderTargetPills = (targets) => {
+      const list = targets || [];
+      if (!list.length) return '<span class="hint">未设置目标频道</span>';
+      return `<div class="channel-pill-list">${list
+        .map(
+          (id) =>
+            `<span class="channel-pill is-target" title="${esc(peerTooltip(id))}"><span class="channel-pill-text">${esc(peerShortName(id))}</span></span>`
+        )
+        .join('')}</div>`;
+    };
+
+    const renderRuleRegexRefs = (r) => {
+      const rxList = (r.regex_ids || []).map(getRegexById).filter(Boolean);
+      const legacyCount =
+        (r.skip_patterns || []).length +
+        (r.strip_text_patterns || []).length +
+        (r.strip_patterns || []).length +
+        (r.replace_patterns || []).length;
+      if (!rxList.length && !legacyCount) {
+        return `<div class="rule-card-regex"><div class="rule-card-regex-head"><span>正则过滤</span><span class="muted">未引用</span></div></div>`;
+      }
+      const chips = rxList
+        .map((rx) => {
+          const meta = REGEX_KIND_META[rx.kind] || { short: rx.kind };
+          return `<button type="button" class="rx-ref-chip kind-${esc(rx.kind)}" data-jump-regex="${esc(rx.id)}" title="${esc(regexContentText(rx))}"><span>${esc(meta.short)}</span><span>·</span><span>${esc(rx.name)}</span></button>`;
+        })
+        .join('');
+      const legacyChip = legacyCount
+        ? `<span class="rx-ref-chip" title="历史内联正则，可在正则管理中统一维护">内联正则 ${legacyCount} 条</span>`
+        : '';
+      return `
+        <div class="rule-card-regex">
+          <div class="rule-card-regex-head">
+            <span>引用正则（${rxList.length}${legacyCount ? ` + ${legacyCount} 内联` : ''}）</span>
+            <a href="#/regex" data-nav="/regex" class="link-toggle-btn">管理</a>
+          </div>
+          <div class="rx-ref-list">${chips}${legacyChip}</div>
+        </div>`;
+    };
+
+    const renderRuleFlags = (r) => {
+      const flags = [];
+      if (r.drop_author !== false) flags.push('<span class="flag-tag">无来源</span>');
+      if (r.fallback_reupload !== false) flags.push('<span class="flag-tag warn">受限重传</span>');
+      if (r.skip_text_only) flags.push('<span class="flag-tag">跳过纯文字</span>');
+      if (r.strip_all_text) flags.push('<span class="flag-tag warn">仅发媒体</span>');
+      if (r.collect_comments) {
+        const mode = (r.comment_merge_mode || state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批' : '凑满';
+        flags.push(`<span class="flag-tag accent">抓评论区 · ${mode}</span>`);
+      }
+      if (r.disable_link_preview) flags.push('<span class="flag-tag">禁链接预览</span>');
+      return flags.length ? `<div class="rule-card-flags">${flags.join('')}</div>` : '';
+    };
+
     return `
       <div class="page-head">
         <div>
           <h1>转发规则</h1>
-          <p class="page-sub">按账号分别配置多对多频道映射、无来源转发、去文本与广告过滤规则</p>
+          <p class="page-sub">按账号配置多对多频道映射与转发策略，正则过滤统一在「正则管理」维护并引用</p>
         </div>
         <div class="page-actions">
+          <button class="btn" data-nav="/regex">正则管理</button>
           <button class="btn primary" id="btn-new-rule">+ 新建规则</button>
         </div>
       </div>
@@ -701,34 +830,48 @@
           ${rules
             .map(
               ({ r, idx }) => `
-            <article class="rule-card">
+            <article class="rule-card ${r.enabled ? '' : 'is-disabled'}">
               <div class="rule-card-head">
-                <div class="rule-card-title" title="${esc(r.name)}">${esc(r.name)}</div>
-                <div class="actions rule-card-actions">
-                  <button class="btn small" data-toggle-rule="${idx}">${r.enabled ? '停用' : '启用'}</button>
-                  <button class="btn small" data-edit-rule="${idx}">编辑</button>
-                  <button class="btn small danger" data-del-rule="${idx}">删除</button>
+                <div class="rule-card-title-group">
+                  <div class="rule-card-title-row">
+                    <span class="rule-status-dot ${r.enabled ? 'is-on' : ''}"></span>
+                    <div class="rule-card-title" title="${esc(r.name)}">${esc(r.name)}</div>
+                  </div>
+                  <div class="rule-card-sub">
+                    <span class="rule-acct-pill">${esc(accountName(r.account_id || 'default'))}</span>
+                    <span>${(r.sources || []).length} 源 → ${(r.targets || []).length} 目标</span>
+                  </div>
+                </div>
+                <div class="rule-card-actions">
+                  <button type="button" class="rule-switch ${r.enabled ? 'is-on' : ''}" data-toggle-rule="${idx}" title="${r.enabled ? '点击停用' : '点击启用'}">
+                    <span class="rule-switch-track"></span>
+                    <span>${r.enabled ? '已启用' : '已停用'}</span>
+                  </button>
+                  <button type="button" class="btn small" data-edit-rule="${idx}">编辑</button>
+                  <button type="button" class="btn small ghost-danger" data-del-rule="${idx}">删除</button>
                 </div>
               </div>
 
-              <div class="rule-card-badges">
-                <span class="badge ${r.enabled ? 'success status' : 'muted'}">${r.enabled ? '已启用' : '已停用'}</span>
-                <span class="badge info">账号: ${esc(accountName(r.account_id || 'default'))}</span>
-                ${r.drop_author !== false ? '<span class="badge info">无来源</span>' : ''}
-                ${r.fallback_reupload !== false ? '<span class="badge warning">受限重传</span>' : ''}
-                ${r.skip_text_only ? '<span class="badge info">跳过纯文字</span>' : ''}
-                ${r.collect_comments ? `<span class="badge info">抓评论区(${(r.comment_merge_mode || state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批' : '凑满'})</span>` : ''}
-                ${r.strip_all_text ? '<span class="badge warning">仅媒体</span>' : ''}
+              ${renderRuleFlags(r)}
+
+              <div class="rule-flow-box">
+                <div class="rule-flow-section">
+                  <div class="rule-flow-head">
+                    <strong>源频道 <span class="count-pill">${(r.sources || []).length}</span></strong>
+                    <span class="muted">悬停查看 ID</span>
+                  </div>
+                  ${renderSourcePills(r.sources, idx)}
+                </div>
+                <div class="rule-flow-divider"></div>
+                <div class="rule-flow-section">
+                  <div class="rule-flow-head">
+                    <strong>→ 目标频道 <span class="count-pill">${(r.targets || []).length}</span></strong>
+                  </div>
+                  ${renderTargetPills(r.targets)}
+                </div>
               </div>
 
-              <div class="rule-peers">
-                <div><span class="muted">源频道：</span>${(r.sources || []).map(peerLabel).join('、') || '<span class="muted">未设置</span>'}</div>
-                <div><span class="muted">目标频道：</span>${(r.targets || []).map(peerLabel).join('、') || '<span class="muted">未设置</span>'}</div>
-              </div>
-
-              <div class="hint rule-card-foot">
-                跳过正则 ${(r.skip_patterns || []).length} 条 · 清文正则 ${(r.strip_text_patterns || []).length} 条 · 去除正则 ${(r.strip_patterns || []).length} 条 · 替换 ${(r.replace_patterns || []).length} 条
-              </div>
+              ${renderRuleRegexRefs(r)}
             </article>`
             )
             .join('')}
@@ -1162,146 +1305,248 @@
     const { idx, data, chats } = state.modalRule;
     const isNew = idx === null;
     const chatList = chats || [];
+    const selectedRxIds = new Set(data.regex_ids || []);
+    const allRegex = state.regexRules || [];
+    const rxFilter = state.modalRuleRxFilter || '';
+    const visibleRegex = rxFilter ? allRegex.filter((rx) => rx.kind === rxFilter) : allRegex;
+    const sortedRegex = [...visibleRegex].sort((a, b) => {
+      const oa = REGEX_KIND_ORDER.indexOf(a.kind);
+      const ob = REGEX_KIND_ORDER.indexOf(b.kind);
+      return (oa === -1 ? 9 : oa) - (ob === -1 ? 9 : ob);
+    });
+
+    const optCard = (id, checked, title, desc, extraCls = '') => `
+      <label class="option-card ${checked ? 'is-checked' : ''} ${extraCls}">
+        <input id="${id}" type="checkbox" ${checked ? 'checked' : ''} />
+        <div class="option-card-body">
+          <strong>${title}</strong>
+          <span>${desc}</span>
+        </div>
+      </label>`;
 
     return `
       <div class="modal-overlay" id="rule-modal-overlay">
-        <div class="modal">
+        <div class="modal modal-lg">
           <div class="modal-head">
-            <h3 class="modal-title">${isNew ? '新建转发规则' : '编辑转发规则'}</h3>
-            <button class="btn ghost icon small" id="btn-close-rule-modal">${icon('close', 17)}</button>
+            <div class="modal-title-wrap">
+              <h3 class="modal-title">${isNew ? '新建转发规则' : `编辑规则 · ${esc(data.name || '未命名规则')}`}</h3>
+              <span class="modal-sub">顶部与底部操作栏固定常驻，按 Esc 可随时关闭</span>
+            </div>
+            <button type="button" class="btn ghost icon small" id="btn-close-rule-modal" title="关闭 (Esc)">${icon('close', 18)}</button>
           </div>
 
-          <div class="stack">
-            <div class="form-grid">
-              <div class="field">
-                <label>规则名称</label>
-                <input id="rm-name" type="text" value="${esc(data.name)}" placeholder="例如：资源频道搬运" />
+          <div class="modal-body" id="rule-modal-body">
+            <section class="modal-section">
+              <div class="modal-section-head">
+                <span class="modal-section-title"><span class="section-step">1</span>基本信息</span>
+                <label class="checkbox" style="font-weight:500;color:var(--text)">
+                  <input id="rm-enabled" type="checkbox" ${data.enabled ? 'checked' : ''} />
+                  <span>启用此规则</span>
+                </label>
               </div>
-              <div class="field">
-                <label>执行账号</label>
-                <select id="rm-account">
-                  ${(state.accounts || []).map((a) => `<option value="${esc(a.id)}" ${(data.account_id || 'default') === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
-                </select>
+              <div class="form-grid">
+                <div class="field">
+                  <label>规则名称</label>
+                  <input id="rm-name" type="text" value="${esc(data.name)}" placeholder="例如：写真 / 舞蹈 / 资讯搬运" />
+                </div>
+                <div class="field">
+                  <label>执行账号</label>
+                  <select id="rm-account">
+                    ${(state.accounts || []).map((a) => `<option value="${esc(a.id)}" ${(data.account_id || 'default') === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
+                  </select>
+                </div>
               </div>
-            </div>
+            </section>
 
-            <label class="checkbox"><input id="rm-enabled" type="checkbox" ${data.enabled ? 'checked' : ''} /> <span>启用此规则</span></label>
-
-            <div class="field">
-              <label>源频道列表（接收新消息的频道）</label>
-              <div class="peer-chip-list">
-                ${(data.sources || []).map((s, i) => `<span class="peer-chip">${peerLabel(s)} <button type="button" data-rm-del-src="${i}">×</button></span>`).join('') || '<span class="hint">暂无源频道</span>'}
+            <section class="modal-section">
+              <div class="modal-section-head">
+                <span class="modal-section-title"><span class="section-step">2</span>频道映射</span>
+                <span class="hint">已选 ${(data.sources || []).length} 个源频道 → ${(data.targets || []).length} 个目标频道</span>
               </div>
-              <div class="row" style="margin-top:6px">
-                <input id="rm-add-src-input" type="text" class="grow" placeholder="输入频道 ID（如 -100123456）或 @username" />
-                <button type="button" class="btn small" id="btn-rm-add-src">添加源</button>
+
+              <div class="mapping-cols">
+                <div class="mapping-col">
+                  <div class="mapping-col-head">
+                    <span>源频道（监听新消息）</span>
+                    <span class="count-pill">${(data.sources || []).length}</span>
+                  </div>
+                  <div class="peer-chip-list">
+                    ${
+                      (data.sources || []).length
+                        ? (data.sources || [])
+                            .map(
+                              (s, i) =>
+                                `<span class="peer-chip" title="${esc(peerTooltip(s))}"><span class="peer-chip-name">${esc(peerShortName(s))}</span><button type="button" data-rm-del-src="${i}" title="移除">×</button></span>`
+                            )
+                            .join('')
+                        : '<span class="hint">暂未选择源频道</span>'
+                    }
+                  </div>
+                  <div class="mapping-add-row">
+                    <input id="rm-add-src-input" type="text" placeholder="手动输入 -100... 或 @username" />
+                    <button type="button" class="btn small" id="btn-rm-add-src">添加</button>
+                  </div>
+                </div>
+
+                <div class="mapping-col">
+                  <div class="mapping-col-head">
+                    <span>目标频道（搬运到这里）</span>
+                    <span class="count-pill">${(data.targets || []).length}</span>
+                  </div>
+                  <div class="peer-chip-list">
+                    ${
+                      (data.targets || []).length
+                        ? (data.targets || [])
+                            .map(
+                              (t, i) =>
+                                `<span class="peer-chip is-target" title="${esc(peerTooltip(t))}"><span class="peer-chip-name">${esc(peerShortName(t))}</span><button type="button" data-rm-del-tgt="${i}" title="移除">×</button></span>`
+                            )
+                            .join('')
+                        : '<span class="hint">暂未选择目标频道</span>'
+                    }
+                  </div>
+                  <div class="mapping-add-row">
+                    <input id="rm-add-tgt-input" type="text" placeholder="手动输入 -100... 或 @username" />
+                    <button type="button" class="btn small" id="btn-rm-add-tgt">添加</button>
+                  </div>
+                </div>
               </div>
-            </div>
 
-            <div class="field">
-              <label>目标频道列表（搬运发送到这里）</label>
-              <div class="peer-chip-list">
-                ${(data.targets || []).map((t, i) => `<span class="peer-chip">${peerLabel(t)} <button type="button" data-rm-del-tgt="${i}">×</button></span>`).join('') || '<span class="hint">暂无目标频道</span>'}
-              </div>
-              <div class="row" style="margin-top:6px">
-                <input id="rm-add-tgt-input" type="text" class="grow" placeholder="输入目标频道 ID（如 -100987654）或 @username" />
-                <button type="button" class="btn small" id="btn-rm-add-tgt">添加目标</button>
-              </div>
-            </div>
-
-            ${
-              chatList.length
-                ? `<div class="field">
-                     <label>从「${esc(accountName(data.account_id || 'default'))}」已加入频道快速勾选（共 ${chatList.length} 个 · 已选 ${(data.sources || []).length} 源 / ${(data.targets || []).length} 目标）</label>
-                     <span class="hint">蓝色高亮 = 当前规则已选；琥珀高亮 = 已被其他规则选中</span>
-                     <div class="picker-toolbar">
-                       <input id="rm-chat-filter" type="text" value="${esc(state.modalPickerQuery)}" placeholder="搜索频道名称、ID 或 @username..." />
-                     </div>
-                     <div class="picker-box" id="rm-picker-box">
-                       ${renderPickerItemsHtml(chatList, data, state.modalPickerQuery, idx)}
-                     </div>
-                   </div>`
-                : '<div class="hint">该账号暂无已加入频道或尚未登录，也可直接手动输入频道 ID / @username</div>'
-            }
-
-            <div class="form-grid">
-              <label class="checkbox"><input id="rm-drop-author" type="checkbox" ${data.drop_author !== false ? 'checked' : ''} /> <span>无来源转发（去除“转发自”）</span></label>
-              <label class="checkbox"><input id="rm-fallback" type="checkbox" ${data.fallback_reupload !== false ? 'checked' : ''} /> <span>禁止转发频道自动下载重传</span></label>
-              <label class="checkbox"><input id="rm-skip-text-only" type="checkbox" ${data.skip_text_only ? 'checked' : ''} /> <span>跳过纯文字消息（保留媒体配文）</span></label>
-              <label class="checkbox"><input id="rm-strip-all-text" type="checkbox" ${data.strip_all_text ? 'checked' : ''} /> <span>去除全部文本（清空配文，仅发媒体）</span></label>
-              <label class="checkbox"><input id="rm-skip-empty" type="checkbox" ${data.skip_empty_text_only !== false ? 'checked' : ''} /> <span>清洗后为空的纯文本跳过</span></label>
-              <label class="checkbox"><input id="rm-no-preview" type="checkbox" ${data.disable_link_preview ? 'checked' : ''} /> <span>禁用链接网页预览</span></label>
-              <label class="checkbox span-full"><input id="rm-collect-comments" type="checkbox" ${data.collect_comments ? 'checked' : ''} /> <span>抓取评论区频道马甲媒体（主帖有字以主帖为准，主帖无字取首条作者评论）</span></label>
-            </div>
-
-            ${
-              data.collect_comments
-                ? `<div class="form-grid" style="padding:12px 14px;background:var(--paper);border:1px solid var(--line);border-radius:10px">
-                     <div class="field">
-                       <label>等待收集窗口覆盖（秒，可选）</label>
-                       <input id="rm-comment-wait" type="number" min="5" max="300" placeholder="跟随全局默认 (${esc(state.ruleGlobalDefaults?.comment_wait_seconds ?? 30)} 秒)" value="${data.comment_wait_seconds != null ? esc(data.comment_wait_seconds) : ''}" />
-                       <span class="hint">留空则使用「全局设置」的默认值；若作者仍在继续发图会自动顺延</span>
-                     </div>
-                     <div class="field">
-                       <label>媒体分组发送方式覆盖（可选）</label>
-                       <select id="rm-comment-mode">
-                         <option value="" ${!data.comment_merge_mode ? 'selected' : ''}>跟随全局默认（${(state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批次' : '自动凑满'}）</option>
-                         <option value="pack" ${data.comment_merge_mode === 'pack' ? 'selected' : ''}>单独指定：自动凑满（每组最多 10 项）</option>
-                         <option value="keep_batches" ${data.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>单独指定：按原批次发送</option>
-                       </select>
-                     </div>
-                   </div>`
-                : ''
-            }
-
-            <div class="field">
-              <label>整条跳过正则（skip_patterns，每行一条）</label>
-              <textarea id="rm-skip" placeholder="(?i)#ad\\b|推广合作">${esc((data.skip_patterns || []).join('\n'))}</textarea>
-              <span class="hint">即使开启「去除全部文本」，仍会先按原配文检查此处正则，拦截广告图片/视频</span>
-            </div>
-
-            <div class="field">
-              <label>命中即清空全部文本正则（strip_text_patterns，每行一条）</label>
-              <textarea id="rm-strip-all-on-match" placeholder="(?i)推广文案|点击看更多">${esc((data.strip_text_patterns || []).join('\n'))}</textarea>
-              <span class="hint">未命中「整条跳过」但命中此处正则时，清空整条消息配文，仅发媒体（纯文字贴自动跳过）</span>
-            </div>
-
-            <div class="field">
-              <label>删除广告文本正则（strip_patterns，每行一条）</label>
-              <textarea id="rm-strip" placeholder="(?m)^.*(?:关注频道|备用频道).*$">${esc((data.strip_patterns || []).join('\n'))}</textarea>
-              <span class="hint">未开启「去除全部文本」时生效；匹配片段会被删除，同时保留正文加粗、超链接与剧透格式</span>
-            </div>
-
-            <div class="field">
-              <label>正则替换（replace_patterns，每行一条：查找正则 => 替换为）</label>
-              <textarea id="rm-replace" placeholder="@old_channel => @my_channel">${esc((data.replace_patterns || []).map((r) => `${r.pattern} => ${r.repl || ''}`).join('\n'))}</textarea>
-            </div>
-
-            <div class="panel" style="padding:14px;background:var(--paper)">
-              <div class="row" style="justify-content:space-between;margin-bottom:8px">
-                <strong style="font-size:13px">在线测试正则清洗效果</strong>
-                <button type="button" class="btn small" id="btn-test-regex">运行测试</button>
-              </div>
-              <div class="field">
-                <textarea id="rm-test-sample" style="min-height:68px">${esc(state.testInput)}</textarea>
-              </div>
               ${
-                state.testOutput
-                  ? `<div class="test-result" style="margin-top:8px">${
-                      state.testOutput.skipped
-                        ? `<span class="badge warning">已拦截跳过</span> 命中规则：<code>${esc(state.testOutput.skip_reason)}</code>（即使开启「去除全部文本」也会被拦截）`
-                        : state.testOutput.cleared_all_text
-                        ? `<span class="badge warning">已清空全部文本</span> 命中：<code>${esc(state.testOutput.clear_reason)}</code>（将仅发送媒体）`
-                        : `<div><span class="badge ${state.testOutput.changed ? 'info' : 'muted'}">${state.testOutput.changed ? '已清洗' : '无变化'}</span></div><div style="margin-top:6px">${esc(state.testOutput.cleaned || '(配文已清空，仅发送媒体)')}</div>`
-                    }</div>`
+                chatList.length
+                  ? `<div class="field">
+                       <div class="row" style="justify-content:space-between;gap:8px">
+                         <label style="color:var(--text-2);font-size:13px;font-weight:500">从「${esc(accountName(data.account_id || 'default'))}」快速勾选（共 ${chatList.length} 个）</label>
+                         <span class="hint">蓝 = 当前规则已选 · 琥珀 = 其他规则已选</span>
+                       </div>
+                       <div class="picker-toolbar">
+                         <input id="rm-chat-filter" type="text" value="${esc(state.modalPickerQuery)}" placeholder="搜索频道名称、ID 或 @username..." />
+                       </div>
+                       <div class="picker-box" id="rm-picker-box">
+                         ${renderPickerItemsHtml(chatList, data, state.modalPickerQuery, idx)}
+                       </div>
+                     </div>`
+                  : '<div class="hint">该账号暂无已加入频道或尚未登录，可直接在上方手动输入频道 ID / @username</div>'
+              }
+            </section>
+
+            <section class="modal-section">
+              <div class="modal-section-head">
+                <span class="modal-section-title"><span class="section-step">3</span>转发策略</span>
+              </div>
+              <div class="option-grid">
+                ${optCard('rm-drop-author', data.drop_author !== false, '无来源转发', '去除“转发自”标签，普通频道零下载秒转')}
+                ${optCard('rm-fallback', data.fallback_reupload !== false, '受限频道自动重传', '遇到禁止转发频道时自动下载缓存后重传')}
+                ${optCard('rm-skip-text-only', !!data.skip_text_only, '跳过纯文字消息', '丢弃无媒体的纯文字贴，保留媒体配文')}
+                ${optCard('rm-strip-all-text', !!data.strip_all_text, '去除全部文本（仅发媒体）', '清空所有配文，仍会先按原配文跑跳过正则')}
+                ${optCard('rm-skip-empty', data.skip_empty_text_only !== false, '跳过清洗后空文本', '纯文字广告被删空后不发空白消息')}
+                ${optCard('rm-no-preview', !!data.disable_link_preview, '禁用链接网页预览', '隐藏消息底部的链接大图卡片')}
+                ${optCard('rm-collect-comments', !!data.collect_comments, '抓取评论区频道马甲媒体', '收集主帖评论区里频道自身发的补图/视频；主帖无字时取首条作者评论', 'span-full')}
+              </div>
+
+              ${
+                data.collect_comments
+                  ? `<div class="form-grid" style="padding:12px 14px;background:var(--surface-muted);border:1px solid var(--line);border-radius:10px">
+                       <div class="field">
+                         <label>评论收集等待窗口（秒，可选覆盖）</label>
+                         <input id="rm-comment-wait" type="number" min="5" max="300" placeholder="跟随全局默认 (${esc(state.ruleGlobalDefaults?.comment_wait_seconds ?? 30)} 秒)" value="${data.comment_wait_seconds != null ? esc(data.comment_wait_seconds) : ''}" />
+                         <span class="hint">留空继承「全局设置」；作者持续补图会自动顺延</span>
+                       </div>
+                       <div class="field">
+                         <label>媒体分组发送方式（可选覆盖）</label>
+                         <select id="rm-comment-mode">
+                           <option value="" ${!data.comment_merge_mode ? 'selected' : ''}>跟随全局默认（${(state.ruleGlobalDefaults?.comment_merge_mode || 'pack') === 'keep_batches' ? '按原批次' : '自动凑满'}）</option>
+                           <option value="pack" ${data.comment_merge_mode === 'pack' ? 'selected' : ''}>单独指定：自动凑满（每组最多 10 项）</option>
+                           <option value="keep_batches" ${data.comment_merge_mode === 'keep_batches' ? 'selected' : ''}>单独指定：按原批次发送</option>
+                         </select>
+                       </div>
+                     </div>`
                   : ''
               }
-            </div>
+            </section>
+
+            <section class="modal-section">
+              <div class="modal-section-head">
+                <span class="modal-section-title"><span class="section-step">4</span>引用正则规则 <span class="count-pill">${selectedRxIds.size}</span></span>
+                <button type="button" class="btn small" id="btn-rm-goto-regex">前往「正则管理」 ↗</button>
+              </div>
+              <div class="hint" style="margin-top:-6px">正则统一在左侧「正则管理」中创建和维护，此处直接勾选引用即可（执行顺序：整条跳过 → 命中清文 → 删除文本 → 查找替换）。</div>
+
+              ${
+                allRegex.length
+                  ? `
+                  <div class="rx-tabs">
+                    <button type="button" class="rx-tab ${!rxFilter ? 'is-active' : ''}" data-rm-rx-filter="">全部 (${allRegex.length})</button>
+                    ${REGEX_KIND_ORDER.map((k) => {
+                      const cnt = allRegex.filter((x) => x.kind === k).length;
+                      if (!cnt) return '';
+                      return `<button type="button" class="rx-tab ${rxFilter === k ? 'is-active' : ''}" data-rm-rx-filter="${k}">${REGEX_KIND_META[k].label} (${cnt})</button>`;
+                    }).join('')}
+                  </div>
+                  <div class="rx-select-list">
+                    ${sortedRegex
+                      .map((rx) => {
+                        const checked = selectedRxIds.has(rx.id);
+                        const meta = REGEX_KIND_META[rx.kind] || { label: rx.kind, badge: 'muted' };
+                        return `
+                          <label class="rx-select-item ${checked ? 'is-selected' : ''}">
+                            <input type="checkbox" data-rm-toggle-rx="${esc(rx.id)}" ${checked ? 'checked' : ''} />
+                            <div class="rx-select-main">
+                              <div class="rx-select-top">
+                                <span class="badge ${meta.badge}">${meta.label}</span>
+                                <strong>${esc(rx.name)}</strong>
+                                ${rx.note ? `<span class="hint">${esc(rx.note)}</span>` : ''}
+                              </div>
+                              <div class="rx-select-code" title="${esc(regexContentText(rx))}">${esc(regexPreviewLine(rx))}</div>
+                            </div>
+                          </label>`;
+                      })
+                      .join('')}
+                  </div>`
+                  : `<div class="empty" style="padding:20px;background:var(--surface-muted);border-radius:10px">
+                       正则库还是空的，先去 <button type="button" class="link-toggle-btn" id="btn-rm-goto-regex-empty">正则管理</button> 添加几条正则再来引用吧～
+                     </div>`
+              }
+
+              <div class="collapsible-box">
+                <button type="button" class="collapsible-head" id="btn-toggle-rm-test">
+                  <span>在线测试当前已选正则效果</span>
+                  <span class="hint">${state.modalRuleTestOpen ? '收起 ▲' : '展开 ▼'}</span>
+                </button>
+                ${
+                  state.modalRuleTestOpen
+                    ? `<div class="collapsible-body">
+                         <div class="field">
+                           <textarea id="rm-test-sample" style="min-height:72px">${esc(state.testInput)}</textarea>
+                         </div>
+                         <div class="actions">
+                           <button type="button" class="btn small primary" id="btn-test-regex">运行测试</button>
+                           <span class="hint">按当前已勾选的 ${selectedRxIds.size} 条正则 +「去除全部文本」开关模拟清洗</span>
+                         </div>
+                         ${
+                           state.testOutput
+                             ? `<div class="test-result">${
+                                 state.testOutput.skipped
+                                   ? `<span class="badge warning">已拦截跳过</span> 命中规则：<code>${esc(state.testOutput.skip_reason)}</code>`
+                                   : state.testOutput.cleared_all_text
+                                   ? `<span class="badge warning">已清空全部文本</span> 命中：<code>${esc(state.testOutput.clear_reason)}</code>（将仅发送媒体）`
+                                   : `<div><span class="badge ${state.testOutput.changed ? 'info' : 'muted'}">${state.testOutput.changed ? '已清洗' : '无变化'}</span></div><div style="margin-top:6px">${esc(state.testOutput.cleaned || '(配文已清空，仅发送媒体)')}</div>`
+                               }</div>`
+                             : ''
+                         }
+                       </div>`
+                    : ''
+                }
+              </div>
+            </section>
           </div>
 
           <div class="modal-actions">
-            <button type="button" class="btn ghost" id="btn-cancel-rule-modal">取消</button>
-            <button type="button" class="btn primary" id="btn-save-rule">保存规则</button>
+            <span class="modal-foot-summary">已选 ${(data.sources || []).length} 源 → ${(data.targets || []).length} 目标 · 引用 ${selectedRxIds.size} 条正则</span>
+            <div class="modal-actions-right">
+              <button type="button" class="btn ghost" id="btn-cancel-rule-modal">取消</button>
+              <button type="button" class="btn primary" id="btn-save-rule">保存规则</button>
+            </div>
           </div>
         </div>
       </div>`;
@@ -1314,17 +1559,21 @@
         <div class="modal" style="max-width:440px">
           <div class="modal-head">
             <h3 class="modal-title">添加 Telegram 账号</h3>
-            <button class="btn ghost icon small" id="btn-close-add-acct">${icon('close', 17)}</button>
+            <button type="button" class="btn ghost icon small" id="btn-close-add-acct">${icon('close', 17)}</button>
           </div>
-          <form id="add-acct-form" class="stack">
-            <div class="field">
-              <label>账号备注名称</label>
-              <input id="add-acct-name" type="text" placeholder="例如：搬运小号2 / 美区小号" required />
-              <span class="hint">添加后即可使用网页扫码或手机号验证码登录</span>
+          <form id="add-acct-form" class="modal-form">
+            <div class="modal-body plain">
+              <div class="field">
+                <label>账号备注名称</label>
+                <input id="add-acct-name" type="text" placeholder="例如：搬运小号2 / 美区小号" required />
+                <span class="hint">添加后即可使用网页扫码或手机号验证码登录</span>
+              </div>
             </div>
             <div class="modal-actions">
-              <button type="button" class="btn ghost" id="btn-cancel-add-acct">取消</button>
-              <button type="submit" class="btn primary">创建并去登录</button>
+              <div class="modal-actions-right">
+                <button type="button" class="btn ghost" id="btn-cancel-add-acct">取消</button>
+                <button type="submit" class="btn primary">创建并去登录</button>
+              </div>
             </div>
           </form>
         </div>
@@ -1402,7 +1651,7 @@
                 • 删固定宣传语：直接写字面文本即可，如 <span class="code-snip">点击加入群组</span>
               </li>
               <li><b>查找替换（replace_patterns）</b>：格式为 <span class="code-snip">查找内容 =&gt; 替换为</span>，如 <span class="code-snip">@old =&gt; @new</span>。</li>
-              <li><b>不会写正则？</b>去左侧「正则生成」页输入关键词一键生成并测试效果，再粘进规则保存（保存即热生效）。</li>
+              <li><b>不会写正则？</b>先去左侧「正则管理」统一创建（内置关键词一键生成与常用模板），再到转发规则里直接勾选引用；之后修改正则库会自动同步热生效到所有引用该正则的规则。</li>
             </ul>
           </div>
         </div>
@@ -1426,8 +1675,8 @@
             <p class="hint" style="margin:6px 0 0">按账号/状态/规则筛选搬运记录：无来源秒转、无下载清洗、下载重传或广告拦截。</p>
           </div>
           <div class="guide-item">
-            <strong>全局设置 & 正则生成</strong>
-            <p class="hint" style="margin:6px 0 0">调节发帖间隔、下载上限与免密 Token；正则生成页提供关键词一键转正则和实时测试。</p>
+            <strong>全局设置 & 正则管理</strong>
+            <p class="hint" style="margin:6px 0 0">调节发帖间隔、下载上限与免密 Token；正则管理统一维护可复用的过滤正则库，内置关键词生成与实时测试。</p>
           </div>
         </div>
       </section>`;
@@ -1442,11 +1691,11 @@
     const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const joined = items.map(escRe).join('|');
     const group = items.length > 1 ? `(?:${joined})` : joined;
-    if (mode === 'skip_words') return `${ignoreCase ? '(?i)' : ''}${joined}`;
-    if (mode === 'strip_all_on_match') return `${ignoreCase ? '(?i)' : ''}${joined}`;
+    if (mode === 'skip' || mode === 'skip_words') return `${ignoreCase ? '(?i)' : ''}${joined}`;
+    if (mode === 'strip_text' || mode === 'strip_all_on_match') return `${ignoreCase ? '(?i)' : ''}${joined}`;
     if (mode === 'strip_line') return `${ignoreCase ? '(?im)' : '(?m)'}^.*${group}.*$`;
     if (mode === 'strip_words') return `${ignoreCase ? '(?i)' : ''}${joined}`;
-    if (mode === 'replace_words') {
+    if (mode === 'replace' || mode === 'replace_words') {
       return String(wordsRaw || '')
         .split('\n')
         .map((l) => l.trim())
@@ -1461,126 +1710,157 @@
     return joined;
   }
 
-  function renderRegexHelper() {
-    const g = state.regexGen;
-    const templates = [
-      { title: '拦截常见广告/推广贴', target: 'skip', desc: '整条消息命中即跳过', pat: '(?i)#ad\\b|广告合作|商务联系|推广' },
-      { title: '拦截带外部网址的帖子', target: 'skip', desc: '含 http 链接但放行 t.me', pat: '(?i)https?://(?!t\\.me/)' },
-      { title: '删掉含关键词的整行广告', target: 'strip', desc: '把整行“关注频道/备用频道”删掉', pat: '(?im)^.*(?:关注频道|备用频道|投稿联系).*$' },
-      { title: '删掉所有 @用户名', target: 'strip', desc: '清空文内或末尾的 @xxx 提及', pat: '@\\w+' },
-      { title: '删掉所有 t.me 频道/群链接', target: 'strip', desc: '移除 https://t.me/xxx 尾巴', pat: '(?i)https?://t\\.me/\\S+' },
-      { title: '删掉所有 #话题标签', target: 'strip', desc: '移除 #标签1 #标签2', pat: '#[\\w\\u4e00-\\u9fff]+' },
-    ];
+  function renderRegexManager() {
+    const all = state.regexRules || [];
+    const fk = state.regexFilterKind || '';
+    const q = (state.regexSearch || '').trim().toLowerCase();
+    const filtered = all.filter((rx) => {
+      if (fk && rx.kind !== fk) return false;
+      if (!q) return true;
+      const hay = `${rx.name || ''} ${rx.note || ''} ${regexContentText(rx)}`.toLowerCase();
+      return hay.includes(q);
+    });
+    const rt = state.regexTest;
+    const selTestSet = new Set(rt.selectedIds || []);
+
     return `
       <div class="page-head">
         <div>
-          <h1>正则生成</h1>
-          <p class="page-sub">不会写正则也没关系：输入想过滤的关键词自动生成，复制后即可用到转发规则里</p>
+          <h1>正则管理</h1>
+          <p class="page-sub">集中管理跳过、清文、去尾与替换正则库，转发规则直接勾选引用；修改后自动同步热生效</p>
         </div>
         <div class="page-actions">
-          <button class="btn primary" data-nav="/rules">去配规则</button>
+          <button class="btn" data-nav="/rules">转发规则</button>
+          <button class="btn primary" id="btn-new-regex">+ 新建正则</button>
         </div>
       </div>
 
       <section class="panel">
-        <div class="panel-head">
-          <h2 class="panel-title">一、关键词一键生成正则</h2>
-          <span class="badge info">自动转义特殊符号</span>
-        </div>
-        <div class="form-grid">
-          <div class="field">
-            <label>想要的效果</label>
-            <select id="rg-mode">
-              <option value="skip_words" ${g.mode === 'skip_words' ? 'selected' : ''}>整条跳过（含任意关键词就整条不转发）</option>
-              <option value="strip_all_on_match" ${g.mode === 'strip_all_on_match' ? 'selected' : ''}>命中就去除文本发送（含关键词就清空全部配文，仅发媒体）</option>
-              <option value="strip_line" ${g.mode === 'strip_line' ? 'selected' : ''}>删掉整行（某一行含关键词就把整行删掉）</option>
-              <option value="strip_words" ${g.mode === 'strip_words' ? 'selected' : ''}>只删词本身（保留同一行里的其他文字）</option>
-              <option value="replace_words" ${g.mode === 'replace_words' ? 'selected' : ''}>查找替换（每行填：旧词 => 新词）</option>
-            </select>
-          </div>
-          <div class="field" style="justify-content:flex-end">
-            <label class="checkbox"><input id="rg-icase" type="checkbox" ${g.ignoreCase ? 'checked' : ''} /> <span>忽略英文字母大小写</span></label>
-          </div>
-          <div class="field span-full">
-            <label>${g.mode === 'replace_words' ? '输入替换内容（每行一条：旧词 => 新词）' : '输入关键词（每行一个，或用逗号隔开）'}</label>
-            <textarea id="rg-words" style="min-height:84px" placeholder="${g.mode === 'replace_words' ? '@原频道 => @我的频道' : '关注频道\n备用频道\n广告合作'}">${esc(g.words)}</textarea>
-          </div>
-          <div class="field span-full">
-            <label>生成结果（${g.mode === 'skip_words' ? '填到规则的「整条跳过正则」' : g.mode === 'strip_all_on_match' ? '填到规则的「命中即清空全部文本正则」' : g.mode === 'replace_words' ? '填到规则的「正则替换」' : '填到规则的「删除广告文本正则」'}）</label>
-            <textarea id="rg-out" readonly style="min-height:60px">${esc(g.out)}</textarea>
-          </div>
-          <div class="span-full actions">
-            <button type="button" class="btn primary" id="btn-rg-copy">复制生成结果</button>
-            <button type="button" class="btn" id="btn-rg-fill">填入下方测试</button>
+        <div class="panel-head" style="margin-bottom:14px">
+          <h2 class="panel-title">正则库（${all.length} 条）</h2>
+          <div class="filter-field" style="min-width:220px">
+            <input id="rx-search" type="text" value="${esc(state.regexSearch)}" placeholder="搜索名称、备注或正则..." />
           </div>
         </div>
-      </section>
 
-      <section class="panel">
-        <div class="panel-head"><h2 class="panel-title">二、常用现成模板（一键复制）</h2></div>
-        <div class="form-grid">
-          ${templates
-            .map(
-              (t, i) => `
-            <div class="guide-item">
-              <div class="row" style="justify-content:space-between;margin-bottom:6px">
-                <strong>${esc(t.title)}</strong>
-                <span class="badge ${t.target === 'skip' ? 'warning' : 'info'}">${t.target === 'skip' ? '跳过规则' : '删除规则'}</span>
-              </div>
-              <div class="hint" style="margin-bottom:8px">${esc(t.desc)}</div>
-              <div class="code-snip" style="width:100%;word-break:break-all;margin-bottom:8px">${esc(t.pat)}</div>
-              <div class="actions">
-                <button type="button" class="btn small" data-copy="${esc(t.pat)}">复制</button>
-                <button type="button" class="btn small" data-tpl-fill="${i}">试用</button>
-              </div>
-            </div>`
-            )
-            .join('')}
+        <div class="rx-tabs" style="margin-bottom:16px">
+          <button type="button" class="rx-tab ${!fk ? 'is-active' : ''}" data-rx-filter="">全部 (${all.length})</button>
+          ${REGEX_KIND_ORDER.map((k) => {
+            const cnt = all.filter((x) => x.kind === k).length;
+            return `<button type="button" class="rx-tab ${fk === k ? 'is-active' : ''}" data-rx-filter="${k}">${REGEX_KIND_META[k].label} (${cnt})</button>`;
+          }).join('')}
         </div>
-      </section>
 
-      <section class="panel">
-        <div class="panel-head">
-          <h2 class="panel-title">三、在线测试清洗效果</h2>
-          <button type="button" class="btn primary small" id="btn-rg-test">运行测试</button>
-        </div>
-        <div class="form-grid">
-          <div class="field span-full">
-            <label>测试消息原文</label>
-            <textarea id="rg-sample" style="min-height:84px">${esc(g.sample)}</textarea>
-          </div>
-          <div class="field">
-            <label>整条跳过正则（skip_patterns）</label>
-            <textarea id="rg-test-skip" style="min-height:70px">${esc(g.skip)}</textarea>
-          </div>
-          <div class="field">
-            <label>命中即清空文本正则（strip_text_patterns）</label>
-            <textarea id="rg-test-strip-all" style="min-height:70px">${esc(g.stripAll || '')}</textarea>
-          </div>
-          <div class="field">
-            <label>删除文本正则（strip_patterns）</label>
-            <textarea id="rg-test-strip" style="min-height:70px">${esc(g.strip)}</textarea>
-          </div>
-          <div class="field">
-            <label>替换规则（每行：查找 => 替换）</label>
-            <textarea id="rg-test-replace" style="min-height:70px">${esc(g.replace)}</textarea>
-          </div>
-        </div>
         ${
-          g.result
-            ? `<div class="test-result" style="margin-top:12px">${
-                g.result.skipped
-                  ? `<span class="badge warning">已拦截跳过</span> 命中规则：<code>${esc(g.result.skip_reason)}</code>`
-                  : g.result.cleared_all_text
-                  ? `<span class="badge warning">已清空全部文本</span> 命中：<code>${esc(g.result.clear_reason)}</code>（将仅发送媒体）`
-                  : `<div><span class="badge ${g.result.changed ? 'info' : 'muted'}">${g.result.changed ? '已清洗' : '无变化'}</span></div><div style="margin-top:6px">${esc(g.result.cleaned || '(空)')}</div>`
-              }</div>`
-            : ''
+          filtered.length
+            ? `<div class="rx-grid">
+                ${filtered
+                  .map((rx) => {
+                    const meta = REGEX_KIND_META[rx.kind] || { label: rx.kind, badge: 'muted' };
+                    const usedBy = rx.used_by || [];
+                    const codeText = regexContentText(rx);
+                    return `
+                  <article class="rx-card">
+                    <div class="rx-card-head">
+                      <div class="rx-card-title-wrap">
+                        <div class="row" style="gap:7px">
+                          <span class="badge ${meta.badge}">${meta.label}</span>
+                          <div class="rx-card-title" title="${esc(rx.name)}">${esc(rx.name)}</div>
+                        </div>
+                        ${rx.note ? `<div class="hint">${esc(rx.note)}</div>` : ''}
+                      </div>
+                      <div class="actions" style="flex-shrink:0;gap:4px">
+                        <button type="button" class="btn small" data-edit-regex="${esc(rx.id)}">编辑</button>
+                        <button type="button" class="btn small ghost-danger" data-del-regex="${esc(rx.id)}">删除</button>
+                      </div>
+                    </div>
+                    <div class="rx-code-box">${esc(codeText)}</div>
+                    <div class="rx-card-foot">
+                      <span>${usedBy.length ? `被引用：${usedBy.map((n) => `<b>${esc(n)}</b>`).join('、')}` : '暂未被转发规则引用'}</span>
+                      <div class="actions" style="gap:6px">
+                        <button type="button" class="link-toggle-btn" data-copy="${esc(codeText)}">复制</button>
+                        <button type="button" class="link-toggle-btn" data-rx-try="${esc(rx.id)}">去测试</button>
+                      </div>
+                    </div>
+                  </article>`;
+                  })
+                  .join('')}
+              </div>`
+            : `<div class="empty">${all.length ? '没有匹配筛选条件的正则规则' : '正则库还是空的，点击右上角「+ 新建正则」或从下方模板一键添加吧～'}</div>`
         }
       </section>
 
       <section class="panel">
-        <div class="panel-head"><h2 class="panel-title">四、30 秒看懂常用符号</h2></div>
+        <div class="panel-head">
+          <h2 class="panel-title">常用现成模板（一键加入正则库）</h2>
+          <span class="hint">添加后可随时编辑关键词或直接被转发规则引用</span>
+        </div>
+        <div class="tpl-grid">
+          ${REGEX_TEMPLATES.map((t, i) => {
+            const meta = REGEX_KIND_META[t.kind] || { label: t.kind, badge: 'muted' };
+            return `
+            <div class="tpl-card">
+              <div class="tpl-card-head">
+                <strong title="${esc(t.name)}">${esc(t.name)}</strong>
+                <span class="badge ${meta.badge}">${meta.label}</span>
+              </div>
+              <div class="hint">${esc(t.desc)}</div>
+              <div class="code-snip" style="width:100%;word-break:break-all;padding:5px 8px">${esc(t.patterns.join('\n'))}</div>
+              <div class="actions">
+                <button type="button" class="btn small primary" data-tpl-add="${i}">+ 加入正则库</button>
+                <button type="button" class="btn small" data-copy="${esc(t.patterns.join('\n'))}">复制</button>
+              </div>
+            </div>`;
+          }).join('')}
+        </div>
+      </section>
+
+      <section class="panel" id="rx-test-section">
+        <div class="panel-head">
+          <h2 class="panel-title">在线测试正则库清洗效果</h2>
+          <button type="button" class="btn primary small" id="btn-rg-test">运行测试</button>
+        </div>
+        <div class="stack" style="gap:14px">
+          <div class="field">
+            <label>勾选参与测试的正则（已选 ${selTestSet.size} 条）</label>
+            ${
+              all.length
+                ? `<div class="rx-test-pills">
+                    ${all
+                      .map((rx) => {
+                        const checked = selTestSet.has(rx.id);
+                        const meta = REGEX_KIND_META[rx.kind] || { short: rx.kind };
+                        return `
+                          <label class="rx-test-pill ${checked ? 'is-selected' : ''}">
+                            <input type="checkbox" data-rx-test-toggle="${esc(rx.id)}" ${checked ? 'checked' : ''} />
+                            <span>[${meta.short}] ${esc(rx.name)}</span>
+                          </label>`;
+                      })
+                      .join('')}
+                  </div>`
+                : '<span class="hint">请先在上方添加至少一条正则</span>'
+            }
+          </div>
+          <div class="field">
+            <label>测试消息原文</label>
+            <textarea id="rg-sample" style="min-height:84px">${esc(rt.sample)}</textarea>
+          </div>
+          ${
+            rt.result
+              ? `<div class="test-result">${
+                  rt.result.skipped
+                    ? `<span class="badge warning">已拦截跳过</span> 命中规则：<code>${esc(rt.result.skip_reason)}</code>`
+                    : rt.result.cleared_all_text
+                    ? `<span class="badge warning">已清空全部文本</span> 命中：<code>${esc(rt.result.clear_reason)}</code>（将仅发送媒体）`
+                    : `<div><span class="badge ${rt.result.changed ? 'info' : 'muted'}">${rt.result.changed ? '已清洗' : '无变化'}</span></div><div style="margin-top:6px">${esc(rt.result.cleaned || '(空)')}</div>`
+                }</div>`
+              : ''
+          }
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2 class="panel-title">30 秒看懂常用正则符号</h2></div>
         <div class="form-grid">
           <div class="guide-item"><span class="code-snip">|</span> <span class="hint" style="margin-left:6px">“或者”的意思，例如 <span class="code-snip">广告|推广</span></span></div>
           <div class="guide-item"><span class="code-snip">(?i)</span> <span class="hint" style="margin-left:6px">放在开头表示忽略英文大小写</span></div>
@@ -1590,6 +1870,102 @@
       </section>`;
   }
 
+  function renderRegexModal() {
+    if (!state.modalRegex) return '';
+    const { id, data, genOpen, genStripMode, genWords, genIgnoreCase } = state.modalRegex;
+    const isNew = !id;
+    const kind = data.kind || 'skip';
+    const meta = REGEX_KIND_META[kind] || REGEX_KIND_META.skip;
+    const contentPlaceholder =
+      kind === 'replace'
+        ? '@old_channel => @my_channel\n旧广告词 => 新文字'
+        : kind === 'strip'
+        ? '(?im)^.*(?:关注频道|备用频道|投稿联系).*$'
+        : '(?i)担保|广告|商务|互推|推广';
+
+    return `
+      <div class="modal-overlay" id="regex-modal-overlay">
+        <div class="modal" style="max-width:680px">
+          <div class="modal-head">
+            <div class="modal-title-wrap">
+              <h3 class="modal-title">${isNew ? '新建正则规则' : `编辑正则 · ${esc(data.name || '')}`}</h3>
+              <span class="modal-sub">${esc(meta.desc)}</span>
+            </div>
+            <button type="button" class="btn ghost icon small" id="btn-close-regex-modal" title="关闭 (Esc)">${icon('close', 18)}</button>
+          </div>
+
+          <form id="regex-modal-form" class="modal-form">
+            <div class="modal-body plain">
+              <div class="form-grid">
+                <div class="field">
+                  <label>正则名称</label>
+                  <input id="rxm-name" type="text" value="${esc(data.name || '')}" placeholder="例如：通用广告拦截 / 去除频道尾巴" required />
+                </div>
+                <div class="field">
+                  <label>作用类型</label>
+                  <select id="rxm-kind">
+                    ${REGEX_KIND_ORDER.map(
+                      (k) => `<option value="${k}" ${kind === k ? 'selected' : ''}>${REGEX_KIND_META[k].label}（${REGEX_KIND_META[k].short}）</option>`
+                    ).join('')}
+                  </select>
+                </div>
+              </div>
+
+              <div class="collapsible-box">
+                <button type="button" class="collapsible-head" id="btn-toggle-rxm-gen">
+                  <span>✨ 不会写正则？用关键词一键生成</span>
+                  <span class="hint">${genOpen ? '收起 ▲' : '展开 ▼'}</span>
+                </button>
+                ${
+                  genOpen
+                    ? `<div class="collapsible-body">
+                         ${
+                           kind === 'strip'
+                             ? `<div class="row" style="gap:12px">
+                                  <label class="checkbox"><input type="radio" name="rxm-strip-mode" value="strip_line" ${genStripMode !== 'strip_words' ? 'checked' : ''} /> <span>删掉含关键词的整行</span></label>
+                                  <label class="checkbox"><input type="radio" name="rxm-strip-mode" value="strip_words" ${genStripMode === 'strip_words' ? 'checked' : ''} /> <span>只删关键词本身</span></label>
+                                </div>`
+                             : ''
+                         }
+                         <div class="field">
+                           <label>${kind === 'replace' ? '输入替换对（每行一条：旧词 => 新词）' : '输入关键词（每行一个，或用逗号隔开）'}</label>
+                           <textarea id="rxm-gen-words" style="min-height:68px" placeholder="${kind === 'replace' ? '@原频道 => @我的频道' : '担保\n广告\n商务合作'}">${esc(genWords || '')}</textarea>
+                         </div>
+                         <div class="row" style="justify-content:space-between">
+                           <label class="checkbox"><input id="rxm-gen-icase" type="checkbox" ${genIgnoreCase !== false ? 'checked' : ''} /> <span>忽略英文大小写</span></label>
+                           <div class="actions">
+                             <button type="button" class="btn small" id="btn-rxm-gen-append">追加到下方</button>
+                             <button type="button" class="btn small primary" id="btn-rxm-gen-replace">生成并填入下方</button>
+                           </div>
+                         </div>
+                       </div>`
+                    : ''
+                }
+              </div>
+
+              <div class="field">
+                <label>${kind === 'replace' ? '替换规则（每行一条：查找正则 => 替换为）' : '正则表达式（每行一条，自动开启多行匹配）'}</label>
+                <textarea id="rxm-content" style="min-height:110px" placeholder="${esc(contentPlaceholder)}" required>${esc(data.content || '')}</textarea>
+                <span class="hint">${kind === 'replace' ? '格式示例：@old_channel => @my_channel（留空右侧表示替换为空）' : '保存时会自动校验正则语法，修改后会自动同步到所有引用它的转发规则'}</span>
+              </div>
+
+              <div class="field">
+                <label>备注说明（可选）</label>
+                <input id="rxm-note" type="text" value="${esc(data.note || '')}" placeholder="例如：适用于写真频道拦截博彩与商务推广" />
+              </div>
+            </div>
+
+            <div class="modal-actions">
+              <div class="modal-actions-right">
+                <button type="button" class="btn ghost" id="btn-cancel-regex-modal">取消</button>
+                <button type="submit" class="btn primary">${isNew ? '创建正则' : '保存修改'}</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>`;
+  }
+
   function renderPasswordModal() {
     if (!state.modalPassword) return '';
     return `
@@ -1597,15 +1973,19 @@
         <div class="modal" style="max-width:460px">
           <div class="modal-head">
             <h3 class="modal-title">修改管理员密码</h3>
-            <button class="btn ghost icon small" id="btn-close-pwd">${icon('close', 17)}</button>
+            <button type="button" class="btn ghost icon small" id="btn-close-pwd">${icon('close', 17)}</button>
           </div>
-          <form id="pwd-form" class="stack">
-            <div class="field"><label>当前密码</label><input id="pwd-cur" type="password" required /></div>
-            <div class="field"><label>新密码（至少 8 位）</label><input id="pwd-new" type="password" minlength="8" required /></div>
-            <div class="field"><label>确认新密码</label><input id="pwd-confirm" type="password" minlength="8" required /></div>
+          <form id="pwd-form" class="modal-form">
+            <div class="modal-body plain">
+              <div class="field"><label>当前密码</label><input id="pwd-cur" type="password" required /></div>
+              <div class="field"><label>新密码（至少 8 位）</label><input id="pwd-new" type="password" minlength="8" required /></div>
+              <div class="field"><label>确认新密码</label><input id="pwd-confirm" type="password" minlength="8" required /></div>
+            </div>
             <div class="modal-actions">
-              <button type="button" class="btn ghost" id="btn-cancel-pwd">取消</button>
-              <button type="submit" class="btn primary">保存新密码</button>
+              <div class="modal-actions-right">
+                <button type="button" class="btn ghost" id="btn-cancel-pwd">取消</button>
+                <button type="submit" class="btn primary">保存新密码</button>
+              </div>
             </div>
           </form>
         </div>
@@ -1616,14 +1996,14 @@
     const navGroups = [
       { label: '工作台', items: [['/', '概览', 'dashboard'], ['/rules', '转发规则', 'rules'], ['/chats', '频道目录', 'chats']] },
       { label: '连接与记录', items: [['/telegram', 'Telegram 账号', 'telegram'], ['/logs', '转发记录', 'logs']] },
-      { label: '系统与帮助', items: [['/settings', '全局设置', 'settings'], ['/log-manage', '日志管理', 'logManage'], ['/regex', '正则生成', 'regex'], ['/guide', '使用说明', 'guide']] },
+      { label: '系统与帮助', items: [['/settings', '全局设置', 'settings'], ['/log-manage', '日志管理', 'logManage'], ['/regex', '正则管理', 'regex'], ['/guide', '使用说明', 'guide']] },
     ];
     const authCnt = (state.accounts || []).filter((a) => a.authorized).length;
     const totalCnt = (state.accounts || []).length;
 
     let bodyHtml = '';
     if (state.route === '/') bodyHtml = renderOverview();
-    else if (state.route === '/regex') bodyHtml = renderRegexHelper();
+    else if (state.route === '/regex') bodyHtml = renderRegexManager();
     else if (state.route === '/guide') bodyHtml = renderGuide();
     else if (state.route === '/logs') bodyHtml = renderLogs();
     else if (state.route === '/log-manage') bodyHtml = renderLogManage();
@@ -1687,6 +2067,7 @@
         </div>
       </div>
       ${renderRuleModal()}
+      ${renderRegexModal()}
       ${renderAddAccountModal()}
       ${renderPasswordModal()}
     </div>`;
@@ -1712,19 +2093,77 @@
       d.comment_wait_seconds = wv ? Math.max(5, Math.min(300, Number(wv))) : null;
     }
     if (g('rm-comment-mode')) d.comment_merge_mode = g('rm-comment-mode').value || '';
-    d.skip_patterns = g('rm-skip').value.split('\n').map((s) => s.trim()).filter(Boolean);
-    d.strip_text_patterns = g('rm-strip-all-on-match').value.split('\n').map((s) => s.trim()).filter(Boolean);
-    d.strip_patterns = g('rm-strip').value.split('\n').map((s) => s.trim()).filter(Boolean);
-    d.replace_patterns = g('rm-replace')
-      .value.split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .map((l) => {
-        const idx = l.indexOf('=>');
-        if (idx === -1) return { pattern: l, repl: '' };
-        return { pattern: l.slice(0, idx).trim(), repl: l.slice(idx + 2).trim() };
+    if (g('rm-test-sample')) state.testInput = g('rm-test-sample').value;
+  }
+
+  function syncRegexModalFromDom() {
+    if (!state.modalRegex) return;
+    const m = state.modalRegex;
+    const g = (id) => document.getElementById(id);
+    if (g('rxm-name')) m.data.name = g('rxm-name').value;
+    if (g('rxm-kind')) m.data.kind = g('rxm-kind').value;
+    if (g('rxm-content')) m.data.content = g('rxm-content').value;
+    if (g('rxm-note')) m.data.note = g('rxm-note').value;
+    if (g('rxm-gen-words')) m.genWords = g('rxm-gen-words').value;
+    if (g('rxm-gen-icase')) m.genIgnoreCase = g('rxm-gen-icase').checked;
+    const stripRadio = document.querySelector('input[name="rxm-strip-mode"]:checked');
+    if (stripRadio) m.genStripMode = stripRadio.value;
+  }
+
+  function openRegexModal(rx = null, prefill = null) {
+    if (rx) {
+      state.modalRegex = {
+        id: rx.id,
+        data: {
+          name: rx.name || '',
+          kind: rx.kind || 'skip',
+          content: regexContentText(rx),
+          note: rx.note || '',
+        },
+        genOpen: false,
+        genStripMode: 'strip_line',
+        genWords: '',
+        genIgnoreCase: true,
+      };
+    } else {
+      state.modalRegex = {
+        id: null,
+        data: {
+          name: prefill?.name || '',
+          kind: prefill?.kind || 'skip',
+          content: prefill?.content || '',
+          note: prefill?.note || '',
+        },
+        genOpen: !prefill?.content,
+        genStripMode: 'strip_line',
+        genWords: '',
+        genIgnoreCase: true,
+      };
+    }
+    render();
+  }
+
+  function parseRegexModalPayload(m) {
+    const kind = m.data.kind || 'skip';
+    const lines = String(m.data.content || '')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const payload = {
+      name: String(m.data.name || '').trim(),
+      kind,
+      note: String(m.data.note || '').trim(),
+    };
+    if (kind === 'replace') {
+      payload.replace_patterns = lines.map((l) => {
+        const i = l.indexOf('=>');
+        if (i === -1) return { pattern: l, repl: '' };
+        return { pattern: l.slice(0, i).trim(), repl: l.slice(i + 2).trim() };
       });
-    state.testInput = g('rm-test-sample').value;
+    } else {
+      payload.patterns = lines;
+    }
+    return payload;
   }
 
   async function loadModalChatsForAccount(acctId) {
@@ -1901,11 +2340,35 @@
     const rulesFilter = document.getElementById('rules-acct-filter');
     if (rulesFilter) rulesFilter.onchange = () => { state.ruleFilterAccount = rulesFilter.value; render(); };
 
+    document.querySelectorAll('[data-toggle-sources]').forEach((b) => {
+      b.onclick = () => {
+        const idx = b.dataset.toggleSources;
+        state.expandedRuleSources[idx] = !state.expandedRuleSources[idx];
+        render();
+      };
+    });
+
+    document.querySelectorAll('[data-jump-regex]').forEach((b) => {
+      b.onclick = () => {
+        const rx = getRegexById(b.dataset.jumpRegex);
+        navigate('/regex');
+        if (rx) {
+          setTimeout(() => {
+            const latest = getRegexById(rx.id) || rx;
+            openRegexModal(latest);
+          }, 50);
+        }
+      };
+    });
+
     const openRuleModal = async (idx, data) => {
       state.testOutput = null;
+      state.modalRuleTestOpen = false;
+      state.modalRuleRxFilter = '';
       state.modalPickerQuery = '';
       const cloned = JSON.parse(JSON.stringify(data));
       if (!cloned.account_id) cloned.account_id = state.accounts[0]?.id || 'default';
+      if (!Array.isArray(cloned.regex_ids)) cloned.regex_ids = [];
       state.modalRule = { idx, data: cloned, chats: [] };
       render();
       loadModalChatsForAccount(cloned.account_id);
@@ -1928,10 +2391,7 @@
           collect_comments: false,
           comment_wait_seconds: null,
           comment_merge_mode: '',
-          skip_patterns: [],
-          strip_text_patterns: [],
-          strip_patterns: [],
-          replace_patterns: [],
+          regex_ids: [],
         });
     }
     document.querySelectorAll('[data-edit-rule]').forEach((el) => {
@@ -1977,7 +2437,7 @@
         loadModalChatsForAccount(e.target.value);
       };
 
-      document.getElementById('btn-rm-add-src').onclick = () => {
+      const addSrc = () => {
         syncRuleModalFromDom();
         const v = document.getElementById('rm-add-src-input').value.trim();
         if (v && !state.modalRule.data.sources.map(String).includes(v)) {
@@ -1985,7 +2445,7 @@
         }
         render();
       };
-      document.getElementById('btn-rm-add-tgt').onclick = () => {
+      const addTgt = () => {
         syncRuleModalFromDom();
         const v = document.getElementById('rm-add-tgt-input').value.trim();
         if (v && !state.modalRule.data.targets.map(String).includes(v)) {
@@ -1993,19 +2453,66 @@
         }
         render();
       };
+      document.getElementById('btn-rm-add-src').onclick = addSrc;
+      document.getElementById('btn-rm-add-tgt').onclick = addTgt;
+      document.getElementById('rm-add-src-input').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); addSrc(); } };
+      document.getElementById('rm-add-tgt-input').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); addTgt(); } };
       document.querySelectorAll('[data-rm-del-src]').forEach((b) => {
         b.onclick = () => { syncRuleModalFromDom(); state.modalRule.data.sources.splice(Number(b.dataset.rmDelSrc), 1); render(); };
       });
       document.querySelectorAll('[data-rm-del-tgt]').forEach((b) => {
         b.onclick = () => { syncRuleModalFromDom(); state.modalRule.data.targets.splice(Number(b.dataset.rmDelTgt), 1); render(); };
       });
-      const rmCollectComments = document.getElementById('rm-collect-comments');
-      if (rmCollectComments) {
-        rmCollectComments.onchange = () => {
+
+      ['rm-drop-author', 'rm-fallback', 'rm-skip-text-only', 'rm-strip-all-text', 'rm-skip-empty', 'rm-no-preview', 'rm-collect-comments'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) {
+          el.onchange = () => {
+            syncRuleModalFromDom();
+            render();
+          };
+        }
+      });
+
+      const gotoRegex = () => {
+        state.modalRule = null;
+        navigate('/regex');
+      };
+      const btnGotoRx = document.getElementById('btn-rm-goto-regex');
+      if (btnGotoRx) btnGotoRx.onclick = gotoRegex;
+      const btnGotoRxEmpty = document.getElementById('btn-rm-goto-regex-empty');
+      if (btnGotoRxEmpty) btnGotoRxEmpty.onclick = gotoRegex;
+
+      document.querySelectorAll('[data-rm-rx-filter]').forEach((b) => {
+        b.onclick = () => {
           syncRuleModalFromDom();
+          state.modalRuleRxFilter = b.dataset.rmRxFilter || '';
+          render();
+        };
+      });
+
+      document.querySelectorAll('[data-rm-toggle-rx]').forEach((cb) => {
+        cb.onchange = () => {
+          syncRuleModalFromDom();
+          const rid = cb.dataset.rmToggleRx;
+          const cur = state.modalRule.data.regex_ids || [];
+          const i = cur.indexOf(rid);
+          if (cb.checked && i === -1) cur.push(rid);
+          else if (!cb.checked && i >= 0) cur.splice(i, 1);
+          state.modalRule.data.regex_ids = cur;
+          render();
+        };
+      });
+
+      const btnToggleTest = document.getElementById('btn-toggle-rm-test');
+      if (btnToggleTest) {
+        btnToggleTest.onclick = () => {
+          syncRuleModalFromDom();
+          state.modalRuleTestOpen = !state.modalRuleTestOpen;
           render();
         };
       }
+
       const bindPickerButtons = () => {
         document.querySelectorAll('[data-pick-src]').forEach((b) => {
           b.onclick = () => {
@@ -2053,26 +2560,26 @@
         };
       }
 
-      document.getElementById('btn-test-regex').onclick = async () => {
-        syncRuleModalFromDom();
-        const d = state.modalRule.data;
-        try {
-          state.testOutput = await api('/api/rules/test', {
-            method: 'POST',
-            body: JSON.stringify({
-              text: state.testInput,
-              strip_all_text: d.strip_all_text,
-              skip_patterns: d.skip_patterns,
-              strip_text_patterns: d.strip_text_patterns,
-              strip_patterns: d.strip_patterns,
-              replace_patterns: d.replace_patterns,
-            }),
-          });
-          render();
-        } catch (err) {
-          toast(err.message, 'danger');
-        }
-      };
+      const btnTestRegex = document.getElementById('btn-test-regex');
+      if (btnTestRegex) {
+        btnTestRegex.onclick = async () => {
+          syncRuleModalFromDom();
+          const d = state.modalRule.data;
+          try {
+            state.testOutput = await api('/api/rules/test', {
+              method: 'POST',
+              body: JSON.stringify({
+                text: state.testInput,
+                strip_all_text: d.strip_all_text,
+                regex_ids: d.regex_ids || [],
+              }),
+            });
+            render();
+          } catch (err) {
+            toast(err.message, 'danger');
+          }
+        };
+      }
 
       document.getElementById('btn-save-rule').onclick = async () => {
         syncRuleModalFromDom();
@@ -2433,75 +2940,161 @@
       };
     });
 
-    // Regex helper controls
-    const rgMode = document.getElementById('rg-mode');
-    if (rgMode) {
-      const updateGen = () => {
-        const g = state.regexGen;
-        g.mode = document.getElementById('rg-mode').value;
-        g.ignoreCase = document.getElementById('rg-icase').checked;
-        g.words = document.getElementById('rg-words').value;
-        g.out = buildGeneratedRegex(g.mode, g.words, g.ignoreCase);
-        const outEl = document.getElementById('rg-out');
-        if (outEl) outEl.value = g.out;
-      };
-      rgMode.onchange = () => { updateGen(); render(); };
-      document.getElementById('rg-icase').onchange = updateGen;
-      document.getElementById('rg-words').oninput = updateGen;
-      document.getElementById('btn-rg-copy').onclick = () => {
-        updateGen();
-        if (!state.regexGen.out) return toast('请先输入关键词', 'danger');
-        copyText(state.regexGen.out, '已复制生成的正则');
-      };
-      document.getElementById('btn-rg-fill').onclick = () => {
-        updateGen();
-        const g = state.regexGen;
-        if (g.mode === 'skip_words') g.skip = g.out;
-        else if (g.mode === 'strip_all_on_match') g.stripAll = g.out;
-        else if (g.mode === 'replace_words') g.replace = g.out;
-        else g.strip = g.out;
-        toast('已填入下方测试区', 'success');
+    // Regex manager controls
+    const btnNewRegex = document.getElementById('btn-new-regex');
+    if (btnNewRegex) btnNewRegex.onclick = () => openRegexModal(null);
+
+    document.querySelectorAll('[data-rx-filter]').forEach((b) => {
+      b.onclick = () => {
+        state.regexFilterKind = b.dataset.rxFilter || '';
         render();
       };
-      const tplList = [
-        { target: 'skip', pat: '(?i)#ad\\b|广告合作|商务联系|推广' },
-        { target: 'skip', pat: '(?i)https?://(?!t\\.me/)' },
-        { target: 'strip', pat: '(?im)^.*(?:关注频道|备用频道|投稿联系).*$' },
-        { target: 'strip', pat: '@\\w+' },
-        { target: 'strip', pat: '(?i)https?://t\\.me/\\S+' },
-        { target: 'strip', pat: '#[\\w\\u4e00-\\u9fff]+' },
-      ];
-      document.querySelectorAll('[data-tpl-fill]').forEach((b) => {
-        b.onclick = () => {
-          const item = tplList[Number(b.dataset.tplFill)];
-          if (!item) return;
-          if (item.target === 'skip') state.regexGen.skip = item.pat;
-          else state.regexGen.strip = item.pat;
-          toast('已填入下方测试区', 'success');
-          render();
-        };
-      });
-      document.getElementById('btn-rg-test').onclick = async () => {
-        const g = state.regexGen;
-        g.sample = document.getElementById('rg-sample').value;
-        g.skip = document.getElementById('rg-test-skip').value;
-        g.stripAll = document.getElementById('rg-test-strip-all').value;
-        g.strip = document.getElementById('rg-test-strip').value;
-        g.replace = document.getElementById('rg-test-replace').value;
+    });
+    const rxSearch = document.getElementById('rx-search');
+    if (rxSearch) {
+      rxSearch.oninput = () => {
+        const pos = rxSearch.selectionStart;
+        state.regexSearch = rxSearch.value;
+        render();
+        const el = document.getElementById('rx-search');
+        if (el) { el.focus(); el.setSelectionRange(pos, pos); }
+      };
+    }
+    document.querySelectorAll('[data-edit-regex]').forEach((b) => {
+      b.onclick = () => {
+        const rx = getRegexById(b.dataset.editRegex);
+        if (rx) openRegexModal(rx);
+      };
+    });
+    document.querySelectorAll('[data-del-regex]').forEach((b) => {
+      b.onclick = async () => {
+        const rx = getRegexById(b.dataset.delRegex);
+        if (!rx) return;
+        const usedBy = rx.used_by || [];
+        const msg = usedBy.length
+          ? `正则「${rx.name}」正被规则「${usedBy.join('、')}」引用，删除后会同时从这些规则中移除引用，确定删除吗？`
+          : `确定要删除正则「${rx.name}」吗？`;
+        if (!confirm(msg)) return;
         try {
-          g.result = await api('/api/rules/test', {
+          const r = await api(`/api/regex/${encodeURIComponent(rx.id)}`, { method: 'DELETE' });
+          state.regexRules = r.items || [];
+          state.regexTest.selectedIds = (state.regexTest.selectedIds || []).filter((id) => id !== rx.id);
+          toast('正则已删除并热重载', 'success');
+          render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
+      };
+    });
+    document.querySelectorAll('[data-rx-try]').forEach((b) => {
+      b.onclick = () => {
+        const rid = b.dataset.rxTry;
+        if (!state.regexTest.selectedIds.includes(rid)) state.regexTest.selectedIds.push(rid);
+        render();
+        const sec = document.getElementById('rx-test-section');
+        if (sec) sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      };
+    });
+    document.querySelectorAll('[data-tpl-add]').forEach((b) => {
+      b.onclick = () => {
+        const tpl = REGEX_TEMPLATES[Number(b.dataset.tplAdd)];
+        if (!tpl) return;
+        openRegexModal(null, {
+          name: tpl.name,
+          kind: tpl.kind,
+          content: tpl.patterns.join('\n'),
+          note: tpl.desc,
+        });
+      };
+    });
+    document.querySelectorAll('[data-rx-test-toggle]').forEach((cb) => {
+      cb.onchange = () => {
+        const rid = cb.dataset.rxTestToggle;
+        const cur = state.regexTest.selectedIds || [];
+        const i = cur.indexOf(rid);
+        if (cb.checked && i === -1) cur.push(rid);
+        else if (!cb.checked && i >= 0) cur.splice(i, 1);
+        state.regexTest.selectedIds = cur;
+        const sampleEl = document.getElementById('rg-sample');
+        if (sampleEl) state.regexTest.sample = sampleEl.value;
+        render();
+      };
+    });
+    const btnRgTest = document.getElementById('btn-rg-test');
+    if (btnRgTest) {
+      btnRgTest.onclick = async () => {
+        const sampleEl = document.getElementById('rg-sample');
+        if (sampleEl) state.regexTest.sample = sampleEl.value;
+        if (!(state.regexTest.selectedIds || []).length) {
+          return toast('请先勾选至少一条参与测试的正则', 'danger');
+        }
+        try {
+          state.regexTest.result = await api('/api/rules/test', {
             method: 'POST',
             body: JSON.stringify({
-              text: g.sample,
-              skip_patterns: g.skip.split('\n').map((s) => s.trim()).filter(Boolean),
-              strip_text_patterns: g.stripAll.split('\n').map((s) => s.trim()).filter(Boolean),
-              strip_patterns: g.strip.split('\n').map((s) => s.trim()).filter(Boolean),
-              replace_patterns: g.replace.split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
-                const i = l.indexOf('=>');
-                return i === -1 ? { pattern: l, repl: '' } : { pattern: l.slice(0, i).trim(), repl: l.slice(i + 2).trim() };
-              }),
+              text: state.regexTest.sample,
+              regex_ids: state.regexTest.selectedIds,
             }),
           });
+          render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
+      };
+    }
+
+    // Regex modal controls
+    if (state.modalRegex) {
+      const closeRxModal = () => { state.modalRegex = null; render(); };
+      document.getElementById('btn-close-regex-modal').onclick = closeRxModal;
+      document.getElementById('btn-cancel-regex-modal').onclick = closeRxModal;
+      document.getElementById('rxm-kind').onchange = () => {
+        syncRegexModalFromDom();
+        render();
+      };
+      document.getElementById('btn-toggle-rxm-gen').onclick = () => {
+        syncRegexModalFromDom();
+        state.modalRegex.genOpen = !state.modalRegex.genOpen;
+        render();
+      };
+      const applyGenerated = (append) => {
+        syncRegexModalFromDom();
+        const m = state.modalRegex;
+        const kind = m.data.kind || 'skip';
+        const mode = kind === 'strip' ? (m.genStripMode || 'strip_line') : kind;
+        const out = buildGeneratedRegex(mode, m.genWords, m.genIgnoreCase !== false);
+        if (!out) return toast('请先输入关键词', 'danger');
+        if (append && m.data.content && m.data.content.trim()) {
+          m.data.content = m.data.content.trimEnd() + '\n' + out;
+        } else {
+          m.data.content = out;
+        }
+        toast('已生成并填入正则框', 'success');
+        render();
+      };
+      const btnGenReplace = document.getElementById('btn-rxm-gen-replace');
+      if (btnGenReplace) btnGenReplace.onclick = () => applyGenerated(false);
+      const btnGenAppend = document.getElementById('btn-rxm-gen-append');
+      if (btnGenAppend) btnGenAppend.onclick = () => applyGenerated(true);
+
+      document.getElementById('regex-modal-form').onsubmit = async (e) => {
+        e.preventDefault();
+        syncRegexModalFromDom();
+        const m = state.modalRegex;
+        const payload = parseRegexModalPayload(m);
+        try {
+          let r;
+          if (m.id) {
+            r = await api(`/api/regex/${encodeURIComponent(m.id)}`, { method: 'PUT', body: JSON.stringify(payload) });
+          } else {
+            r = await api('/api/regex', { method: 'POST', body: JSON.stringify(payload) });
+          }
+          state.regexRules = r.items || [];
+          if (!m.id && r.id && !state.regexTest.selectedIds.includes(r.id)) {
+            state.regexTest.selectedIds.push(r.id);
+          }
+          state.modalRegex = null;
+          toast(m.id ? '正则已更新，并已热同步到关联规则' : '正则已添加到正则库', 'success');
           render();
         } catch (err) {
           toast(err.message, 'danger');
@@ -2511,19 +3104,30 @@
   }
 
   function render() {
-    const modalEl = document.querySelector('#rule-modal-overlay .modal');
+    const ruleBody = document.querySelector('#rule-modal-overlay .modal-body');
+    const rxBody = document.querySelector('#regex-modal-overlay .modal-body');
     const pickerEl = document.getElementById('rm-picker-box');
-    const modalScroll = modalEl ? modalEl.scrollTop : 0;
+    const ruleScroll = ruleBody ? ruleBody.scrollTop : 0;
+    const rxScroll = rxBody ? rxBody.scrollTop : 0;
     const pickerScroll = pickerEl ? pickerEl.scrollTop : 0;
     document.getElementById('app').innerHTML = state.authed ? renderApp() : renderLogin();
     bindEvents();
-    const newModalEl = document.querySelector('#rule-modal-overlay .modal');
+    const newRuleBody = document.querySelector('#rule-modal-overlay .modal-body');
+    const newRxBody = document.querySelector('#regex-modal-overlay .modal-body');
     const newPickerEl = document.getElementById('rm-picker-box');
-    if (newModalEl && modalScroll) newModalEl.scrollTop = modalScroll;
+    if (newRuleBody && ruleScroll) newRuleBody.scrollTop = ruleScroll;
+    if (newRxBody && rxScroll) newRxBody.scrollTop = rxScroll;
     if (newPickerEl && pickerScroll) newPickerEl.scrollTop = pickerScroll;
   }
 
   async function boot() {
+    window.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if (state.modalRegex) { state.modalRegex = null; render(); }
+      else if (state.modalRule) { state.modalRule = null; render(); }
+      else if (state.modalAddAccount) { state.modalAddAccount = false; render(); }
+      else if (state.modalPassword) { state.modalPassword = false; render(); }
+    });
     window.addEventListener('hashchange', () => {
       const next = location.hash.replace(/^#/, '') || '/';
       if (next !== state.route) {

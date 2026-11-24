@@ -357,6 +357,83 @@ def test_find_matched_regex_branches() -> None:
     assert find_matched_regex_branches("contains foo here", r"a\|b|foo") == ["foo"]
 
 
+def test_regex_library_and_web_crud() -> None:
+    from web_server import WebConsole
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td)
+        cfg_path = p / "config.yaml"
+        save_raw_config(
+            cfg_path,
+            {
+                "global": {"delay_seconds": 1.0},
+                "accounts": [{"id": "default", "name": "主号", "enabled": True}],
+                "regex_rules": [
+                    {"id": "rx_ad", "name": "广告跳过", "kind": "skip", "patterns": ["(?i)广告|推广"]},
+                    {"id": "rx_tail", "name": "去尾巴", "kind": "strip", "patterns": ["(?m)^.*关注频道.*$"]},
+                    {"id": "rx_rep", "name": "换署名", "kind": "replace", "replace_patterns": [{"pattern": "@old", "repl": "@new"}]},
+                ],
+                "rules": [
+                    {
+                        "name": "写真",
+                        "enabled": True,
+                        "account_id": "default",
+                        "sources": [-1001],
+                        "targets": [-1002],
+                        "regex_ids": ["rx_ad", "rx_tail", "rx_rep"],
+                    }
+                ],
+            },
+        )
+        cfg = load_config(cfg_path)
+        rule = cfg.rules[0]
+        assert should_skip_text("这是广告内容", rule) is not None
+        cleaned, _, changed = clean_message_text("你好 @old\n关注频道 @xxx", None, rule)
+        assert changed is True and cleaned == "你好 @new"
+
+        class DummyManager:
+            reloaded = 0
+
+            async def reload_all(self, force=False):
+                self.reloaded += 1
+
+            def all_chat_titles(self):
+                return {}
+
+        class FakeReq:
+            def __init__(self, payload=None, match_info=None):
+                self._payload = payload or {}
+                self.can_read_body = payload is not None
+                self.match_info = match_info or {}
+
+            async def json(self):
+                return self._payload
+
+        async def _run():
+            mgr = DummyManager()
+            console = WebConsole(mgr, AuthStore(p / "s.db"), cfg_path, p, p)
+            r_list = await console.handle_regex_list(FakeReq())
+            assert r_list.status == 200 and '"used_by": ["\\u5199\\u771f"]' in r_list.text
+
+            r_create = await console.handle_regex_create(
+                FakeReq({"name": "清文", "kind": "strip_text", "patterns": ["(?i)仅发图"]})
+            )
+            assert r_create.status == 200 and '"ok": true' in r_create.text
+
+            r_test = await console.handle_rule_test(
+                FakeReq({"text": "你好 @old\n关注频道 @xxx", "regex_ids": ["rx_tail", "rx_rep"]})
+            )
+            assert r_test.status == 200 and '"cleaned": "\\u4f60\\u597d @new"' in r_test.text
+
+            r_del = await console.handle_regex_delete(FakeReq(match_info={"rx_id": "rx_ad"}))
+            assert r_del.status == 200
+            cfg2 = load_config(cfg_path)
+            assert should_skip_text("这是广告内容", cfg2.rules[0]) is None
+            assert mgr.reloaded >= 2
+
+        asyncio.run(_run())
+
+
 if __name__ == "__main__":
     test_clean_preserves_utf16_entities()
     test_strip_all_text_still_runs_skip_filter()
@@ -369,4 +446,5 @@ if __name__ == "__main__":
     test_find_matched_regex_branches()
     test_stores_and_config_roundtrip()
     test_history_pagination()
+    test_regex_library_and_web_crud()
     print("ALL TESTS PASSED")

@@ -15,6 +15,24 @@ accounts:
     name: 主账号
     enabled: true
 
+regex_rules:
+  - id: rx_ad_skip
+    name: 通用广告跳过
+    kind: skip
+    patterns:
+      - "(?i)#sponsored|广告推广"
+  - id: rx_footer_strip
+    name: 去除关注尾巴
+    kind: strip
+    patterns:
+      - "(?m)^.*关注备用频道.*$"
+  - id: rx_channel_replace
+    name: 替换频道署名
+    kind: replace
+    replace_patterns:
+      - pattern: "@old_channel"
+        repl: "@my_channel"
+
 rules:
   - name: 示例搬运规则
     enabled: false
@@ -33,11 +51,7 @@ rules:
     # Optional per-rule overrides (omit to inherit global defaults):
     # comment_wait_seconds: 30
     # comment_merge_mode: pack
-    skip_patterns:
-      - "(?i)#sponsored|广告推广"
-    strip_text_patterns: []
-    strip_patterns:
-      - "(?m)^.*关注备用频道.*$"
-    replace_patterns:
-      - pattern: "@old_channel"
-        repl: "@my_channel"
+    regex_ids:
+      - rx_ad_skip
+      - rx_footer_strip
+      - rx_channel_replace
