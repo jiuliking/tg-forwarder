@@ -50,9 +50,13 @@ chmod 600 config.yaml
 .venv/bin/python forwarder.py
 ```
 
-首次启动会在控制台日志中输出：
-- 随机生成的管理员初始密码（登录后建议立即修改）
-- 带 `?token=...` 的免密直达链接（默认监听 `http://127.0.0.1:28081`）
+首次启动后，在服务目录内用交互式终端设置管理员密码：
+
+```bash
+.venv/bin/python common.py reset-web-password
+```
+
+Web 控制台默认监听 `http://127.0.0.1:28081`。登录后可在全局设置复制免密链接。Token 放在 URL 片段中，由浏览器通过登录请求提交。轮换 Token 会使所有现有 Web 会话失效。
 
 ### 3. 登录账号与配置规则
 
@@ -73,6 +77,7 @@ chmod 600 config.yaml
 - 运行核心单元测试：
   ```bash
   .venv/bin/python test_common.py
+  .venv/bin/python -m unittest test_forwarder
   ```
 
 ## 生产部署（systemd + Nginx）

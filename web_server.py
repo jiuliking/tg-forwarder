@@ -11,7 +11,7 @@ from typing import Any
 import qrcode
 from aiohttp import web
 from telethon import utils
-from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError
+from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, RPCError, SessionPasswordNeededError, UnauthorizedError
 
 from common import (
     AuthStore,
@@ -121,21 +121,7 @@ class WebConsole:
         except OSError:
             return "0"
 
-    async def handle_index(self, request: web.Request) -> web.StreamResponse:
-        tok = request.query.get("token", "")
-        if tok and self.auth.verify_access_token(tok):
-            sess = self.auth.create_session()
-            resp = web.HTTPFound("/")
-            resp.set_cookie(
-                SESSION_COOKIE,
-                sess,
-                max_age=self.auth.SESSION_TTL,
-                httponly=True,
-                secure=self._is_https(request),
-                samesite="Lax",
-                path="/",
-            )
-            raise resp
+    async def handle_index(self, _request: web.Request) -> web.StreamResponse:
         html = (self.ui_dir / "index.html").read_text(encoding="utf-8")
         css_v = self._asset_version("styles.css")
         js_v = self._asset_version("app.js")
@@ -167,7 +153,12 @@ class WebConsole:
         raise web.HTTPNotFound()
 
     async def handle_healthz(self, _request: web.Request) -> web.Response:
-        return web.json_response({"ok": True})
+        enabled = [account.id for account in self.manager.cfg.accounts if account.enabled]
+        ok = all(
+            (runner := self.manager.get_runner(account_id)) is not None and runner.listening
+            for account_id in enabled
+        )
+        return web.json_response({"ok": ok}, status=200 if ok else 503)
 
     async def handle_auth_status(self, request: web.Request) -> web.Response:
         return web.json_response({"authenticated": self._is_authed(request)})
@@ -661,6 +652,7 @@ class WebConsole:
             valid_rx = {str(x["id"]) for x in (raw.get("regex_rules") or []) if isinstance(x, dict) and x.get("id")}
             try:
                 rule = self._sanitize_rule_payload(data, default_acct, valid_regex_ids=valid_rx)
+                rule["id"] = "rule_" + secrets.token_hex(12)
                 raw["rules"].append(rule)
                 save_raw_config(self.config_path, raw)
             except ValueError as exc:
@@ -668,20 +660,24 @@ class WebConsole:
             await self.manager.reload_all(force=True)
         return web.json_response({"ok": True, "rules": raw["rules"]})
 
+    @staticmethod
+    def _rule_index(raw: dict[str, Any], rule_id: str) -> int | None:
+        return next((idx for idx, rule in enumerate(raw["rules"]) if rule["id"] == rule_id), None)
+
     async def handle_rule_update(self, request: web.Request) -> web.Response:
-        try:
-            idx = int(request.match_info["idx"])
-        except ValueError:
-            return web.json_response({"error": "无效的规则序号"}, status=400)
+        rule_id = request.match_info["rule_id"]
         data = await self._read_json(request)
         async with self._config_lock:
             raw = load_raw_config(self.config_path)
-            if idx < 0 or idx >= len(raw["rules"]):
+            idx = self._rule_index(raw, rule_id)
+            if idx is None:
                 return web.json_response({"error": "规则不存在"}, status=404)
             default_acct = raw["accounts"][0]["id"] if raw.get("accounts") else "default"
             valid_rx = {str(x["id"]) for x in (raw.get("regex_rules") or []) if isinstance(x, dict) and x.get("id")}
             try:
-                raw["rules"][idx] = self._sanitize_rule_payload(data, default_acct, valid_regex_ids=valid_rx)
+                replacement = self._sanitize_rule_payload(data, default_acct, valid_regex_ids=valid_rx)
+                replacement["id"] = rule_id
+                raw["rules"][idx] = replacement
                 save_raw_config(self.config_path, raw)
             except ValueError as exc:
                 return web.json_response({"error": f"规则参数或正则有误: {exc}"}, status=400)
@@ -689,13 +685,10 @@ class WebConsole:
         return web.json_response({"ok": True, "rules": raw["rules"]})
 
     async def handle_rule_delete(self, request: web.Request) -> web.Response:
-        try:
-            idx = int(request.match_info["idx"])
-        except ValueError:
-            return web.json_response({"error": "无效的规则序号"}, status=400)
         async with self._config_lock:
             raw = load_raw_config(self.config_path)
-            if idx < 0 or idx >= len(raw["rules"]):
+            idx = self._rule_index(raw, request.match_info["rule_id"])
+            if idx is None:
                 return web.json_response({"error": "规则不存在"}, status=404)
             raw["rules"].pop(idx)
             save_raw_config(self.config_path, raw)
@@ -703,13 +696,10 @@ class WebConsole:
         return web.json_response({"ok": True, "rules": raw["rules"]})
 
     async def handle_rule_toggle(self, request: web.Request) -> web.Response:
-        try:
-            idx = int(request.match_info["idx"])
-        except ValueError:
-            return web.json_response({"error": "无效的规则序号"}, status=400)
         async with self._config_lock:
             raw = load_raw_config(self.config_path)
-            if idx < 0 or idx >= len(raw["rules"]):
+            idx = self._rule_index(raw, request.match_info["rule_id"])
+            if idx is None:
                 return web.json_response({"error": "规则不存在"}, status=404)
             raw["rules"][idx]["enabled"] = not bool(raw["rules"][idx].get("enabled", True))
             enabled = raw["rules"][idx]["enabled"]
@@ -787,7 +777,8 @@ class WebConsole:
                 "api_hash_masked": masked_hash,
                 "api_custom": is_custom,
                 "access_token": self.auth.get_access_token(),
-            }
+            },
+            headers={"Cache-Control": "no-store"},
         )
 
     async def handle_settings_put(self, request: web.Request) -> web.Response:
@@ -840,8 +831,10 @@ class WebConsole:
         return web.json_response({"ok": True})
 
     async def handle_token_rotate(self, _request: web.Request) -> web.Response:
-        tok = self.auth.rotate_access_token()
-        return web.json_response({"access_token": tok})
+        self.auth.rotate_access_token()
+        response = web.json_response({"ok": True})
+        response.del_cookie(SESSION_COOKIE, path="/")
+        return response
 
     def _resolve_runner_or_404(self, acct_id: str) -> Any:
         runner = self.manager.get_runner(acct_id)
@@ -1020,10 +1013,19 @@ class WebConsole:
         runner = self.manager.get_runner(acct_id)
         if not runner or not runner.enabled:
             return web.json_response({"authorized": False, "account_id": acct_id, "items": []})
-        if not await runner.ensure_authorized(verify_live=True):
-            return web.json_response({"authorized": False, "account_id": acct_id, "items": []})
-
         refresh = request.query.get("refresh", "0") == "1"
+        try:
+            if not await runner.ensure_authorized(verify_live=True):
+                return web.json_response({"authorized": False, "account_id": acct_id, "items": []})
+            return await self._load_chats(runner, acct_id, refresh)
+        except UnauthorizedError:
+            runner.mark_unauthorized()
+            return web.json_response({"authorized": False, "account_id": acct_id, "items": []})
+        except (RPCError, OSError, TimeoutError):
+            log.warning("Telegram directory refresh failed for %s", acct_id, exc_info=True)
+            return web.json_response({"error": "暂时无法读取 Telegram 频道目录，请重试"}, status=503)
+
+    async def _load_chats(self, runner: Any, acct_id: str, refresh: bool) -> web.Response:
         if refresh or not runner.chats_cache:
             items: list[dict[str, Any]] = []
             async for d in runner.client.iter_dialogs():
@@ -1073,9 +1075,9 @@ class WebConsole:
         app.router.add_post("/api/logs/clear", self.handle_logs_clear)
         app.router.add_get("/api/rules", self.handle_rules_list)
         app.router.add_post("/api/rules", self.handle_rule_create)
-        app.router.add_put("/api/rules/{idx}", self.handle_rule_update)
-        app.router.add_delete("/api/rules/{idx}", self.handle_rule_delete)
-        app.router.add_post("/api/rules/{idx}/toggle", self.handle_rule_toggle)
+        app.router.add_put("/api/rules/{rule_id}", self.handle_rule_update)
+        app.router.add_delete("/api/rules/{rule_id}", self.handle_rule_delete)
+        app.router.add_post("/api/rules/{rule_id}/toggle", self.handle_rule_toggle)
         app.router.add_post("/api/rules/test", self.handle_rule_test)
 
         app.router.add_get("/api/regex", self.handle_regex_list)

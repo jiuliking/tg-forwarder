@@ -10,7 +10,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 import yaml
 
@@ -76,6 +76,7 @@ class CompiledRule:
     strip_text_patterns: list[re.Pattern[str]] = field(default_factory=list)
     strip_patterns: list[re.Pattern[str]] = field(default_factory=list)
     replace_patterns: list[CompiledReplace] = field(default_factory=list)
+    id: str = ""
 
 
 @dataclass
@@ -248,6 +249,7 @@ def compile_rule_dict(
     )
     return CompiledRule(
         name=name,
+        id=str(r.get("id") or ""),
         enabled=bool(r.get("enabled", True)),
         account_id=account_id,
         sources=[normalize_peer(x) for x in (r.get("sources") or []) if str(x).strip()],
@@ -278,9 +280,13 @@ def load_raw_config(config_path: Path) -> dict[str, Any]:
     if not raw.get("accounts"):
         raw["accounts"] = [{"id": "default", "name": "默认账号", "enabled": True}]
     rules = raw.get("rules") or []
-    for r in rules:
+    for idx, r in enumerate(rules):
         if not r.get("account_id"):
             r["account_id"] = raw["accounts"][0]["id"]
+        if not r.get("id"):
+            # Stable before the first save, when the IDs are persisted with the rules.
+            initial = json.dumps([idx, r], sort_keys=True, ensure_ascii=False, default=str)
+            r["id"] = "rule_" + hashlib.sha256(initial.encode()).hexdigest()[:24]
     raw["rules"] = rules
     return raw
 
@@ -714,6 +720,19 @@ class DedupStore:
             )
             """
         )
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS delivery_parts (
+                account_id TEXT NOT NULL,
+                source_id INTEGER NOT NULL,
+                msg_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                delivery_key TEXT NOT NULL,
+                part TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (account_id, source_id, msg_id, target_id, delivery_key, part)
+            )
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_parts_ts ON delivery_parts(created_at)")
         old_exists = self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='forwarded'"
         ).fetchone()
@@ -735,9 +754,13 @@ class DedupStore:
         return row is not None
 
     def mark(self, source_id: int, msg_id: int, target_id: int, account_id: str = "default") -> None:
-        self.conn.execute(
+        self.mark_many(source_id, (msg_id,), target_id, account_id)
+
+    def mark_many(self, source_id: int, msg_ids: Iterable[int], target_id: int, account_id: str = "default") -> None:
+        now = int(time.time())
+        self.conn.executemany(
             "INSERT OR REPLACE INTO forwarded_v2 (account_id, source_id, msg_id, target_id, created_at) VALUES (?, ?, ?, ?, ?)",
-            (account_id, source_id, msg_id, target_id, int(time.time())),
+            ((account_id, source_id, msg_id, target_id, now) for msg_id in msg_ids),
         )
         self.conn.commit()
 
@@ -745,6 +768,27 @@ class DedupStore:
         cutoff = int(time.time()) - max(1, ttl_hours) * 3600
         self.conn.execute("DELETE FROM forwarded_v2 WHERE created_at < ?", (cutoff,))
         self.conn.commit()
+
+    def delivery_parts(self, key: tuple[str, int, int, int, str]) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT part FROM delivery_parts WHERE account_id=? AND source_id=? AND msg_id=? AND target_id=? AND delivery_key=?",
+            key,
+        )
+        return {row[0] for row in rows}
+
+    def mark_delivery_parts(self, key: tuple[str, int, int, int, str], parts: Iterable[str]) -> None:
+        now = int(time.time())
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO delivery_parts VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ((*key, part, now) for part in parts),
+            )
+
+    def prune_delivery_parts(self, retention_days: int) -> None:
+        if retention_days > 0:
+            cutoff = int(time.time()) - retention_days * 86400
+            with self.conn:
+                self.conn.execute("DELETE FROM delivery_parts WHERE created_at < ?", (cutoff,))
 
 
 class HistoryStore:
@@ -783,6 +827,9 @@ class HistoryStore:
             self.conn.execute("ALTER TABLE history ADD COLUMN account_name TEXT NOT NULL DEFAULT '默认账号'")
         if "matched_terms" not in cols:
             self.conn.execute("ALTER TABLE history ADD COLUMN matched_terms TEXT NOT NULL DEFAULT ''")
+        for column in ("delivery_key", "rule_id", "album_group_id"):
+            if column not in cols:
+                self.conn.execute(f"ALTER TABLE history ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts DESC)")
         self.conn.commit()
 
@@ -803,14 +850,17 @@ class HistoryStore:
         preview: str = "",
         detail: str = "",
         matched_terms: Sequence[str] = (),
+        delivery_key: str = "",
+        rule_id: str = "",
+        album_group_id: str = "",
     ) -> None:
         snippet = (preview or "").replace("\n", " ").strip()[:160]
         terms_json = json.dumps(list(matched_terms), ensure_ascii=False) if matched_terms else ""
         self.conn.execute(
             """
             INSERT INTO history
-            (ts, account_id, account_name, rule_name, source_id, source_title, target_id, target_title, msg_id, item_count, mode, status, preview, detail, matched_terms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ts, account_id, account_name, rule_name, source_id, source_title, target_id, target_title, msg_id, item_count, mode, status, preview, detail, matched_terms, delivery_key, rule_id, album_group_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(time.time()),
@@ -828,6 +878,9 @@ class HistoryStore:
                 snippet,
                 (detail or "")[:400],
                 terms_json[:500],
+                delivery_key,
+                rule_id,
+                album_group_id,
             ),
         )
         self._apply_prune_sql(self.retention_days, self.max_rows)
@@ -1060,7 +1113,9 @@ class AuthStore:
 
     def rotate_access_token(self) -> str:
         tok = secrets.token_urlsafe(24)
-        self._set("access_token", tok)
+        with self.conn:
+            self.conn.execute("INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('access_token', ?)", (tok,))
+            self.conn.execute("DELETE FROM web_sessions")
         return tok
 
     def verify_password(self, password: str) -> bool:
@@ -1069,7 +1124,7 @@ class AuthStore:
 
     def verify_access_token(self, token: str) -> bool:
         expected = self.get_access_token()
-        return bool(token) and bool(expected) and hmac.compare_digest(token, expected)
+        return bool(token) and bool(expected) and token.isascii() and hmac.compare_digest(token, expected)
 
     def change_password(self, current_password: str, new_password: str, keep_session: str = "") -> bool:
         if not self.verify_password(current_password):
@@ -1107,3 +1162,23 @@ class AuthStore:
             return
         self.conn.execute("DELETE FROM web_sessions WHERE token=?", (tok,))
         self.conn.commit()
+
+
+if __name__ == "__main__":
+    import argparse
+    import getpass
+    import sys
+
+    parser = argparse.ArgumentParser(description="Manage the local Web Console password")
+    parser.add_argument("command", choices=["reset-web-password"])
+    parser.parse_args()
+    if not sys.stdin.isatty():
+        parser.error("Run this command in an interactive terminal")
+    password = getpass.getpass("New Web Console password: ")
+    if len(password) < 8 or password != getpass.getpass("Confirm password: "):
+        parser.error("Use at least 8 characters and enter the same password twice")
+    auth = AuthStore(Path(os.environ.get("TG_FWD_DIR") or Path(__file__).resolve().parent) / "state.db")
+    with auth.conn:
+        auth.conn.execute("INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('password_hash', ?)", (auth._hash_password(password),))
+        auth.conn.execute("DELETE FROM web_sessions")
+    print("Web Console password updated. Existing web sessions revoked.")

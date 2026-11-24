@@ -330,7 +330,7 @@
           </div>
           <button class="btn primary" type="submit">进入控制台</button>
         </form>
-        <p class="login-help">也可直接打开日志中的 <code>?token=...</code> 直达链接登录。若忘记密码，可在服务器查看 <code>journalctl -u tg-forwarder</code>。</p>
+        <p class="login-help">首次登录或忘记密码，请在服务器运行 <code>.venv/bin/python common.py reset-web-password</code>。</p>
       </div>
     </div>`;
   }
@@ -1072,7 +1072,7 @@
   function renderSettings() {
     const s = state.settings;
     if (!s) return '<div class="panel empty">加载设置中...</div>';
-    const tokenUrl = `${location.origin}/?token=${s.access_token}`;
+    const tokenUrl = `${location.origin}/#access-token=${encodeURIComponent(s.access_token)}`;
     return `
       <div class="page-head">
         <div>
@@ -1145,7 +1145,7 @@
         <div class="field">
           <label>直达登录链接</label>
           <input type="text" readonly class="mono" value="${esc(tokenUrl)}" />
-          <span class="hint">包含访问 Token，可直接打开登录（等同于 SaveAny-Bot 的 /?token=...）</span>
+          <span class="hint">包含访问 Token，请妥善保管。</span>
         </div>
         <div class="actions" style="margin-top:14px">
           <button class="btn" data-copy="${esc(tokenUrl)}">复制直达链接</button>
@@ -2404,7 +2404,7 @@
       el.onclick = async () => {
         const idx = Number(el.dataset.toggleRule);
         try {
-          await api(`/api/rules/${idx}/toggle`, { method: 'POST' });
+          await api(`/api/rules/${encodeURIComponent(state.rules[idx].id)}/toggle`, { method: 'POST' });
           await loadRouteData('/rules');
           toast('规则状态已切换', 'success');
         } catch (err) {
@@ -2417,7 +2417,7 @@
         const idx = Number(el.dataset.delRule);
         if (!confirm(`确定要删除规则「${state.rules[idx]?.name}」吗？`)) return;
         try {
-          await api(`/api/rules/${idx}`, { method: 'DELETE' });
+          await api(`/api/rules/${encodeURIComponent(state.rules[idx].id)}`, { method: 'DELETE' });
           await loadRouteData('/rules');
           toast('规则已删除', 'success');
         } catch (err) {
@@ -2588,7 +2588,7 @@
           if (idx === null) {
             await api('/api/rules', { method: 'POST', body: JSON.stringify(data) });
           } else {
-            await api(`/api/rules/${idx}`, { method: 'PUT', body: JSON.stringify(data) });
+            await api(`/api/rules/${encodeURIComponent(data.id)}`, { method: 'PUT', body: JSON.stringify(data) });
           }
           state.modalRule = null;
           await loadRouteData('/rules');
@@ -2870,11 +2870,12 @@
     const btnRotate = document.getElementById('btn-rotate-token');
     if (btnRotate) {
       btnRotate.onclick = async () => {
-        if (!confirm('确定要重置访问 Token 吗？旧的直达链接将失效。')) return;
+        if (!confirm('确定要重置访问 Token 吗？旧直达链接及所有网页会话将失效。')) return;
         try {
-          const r = await api('/api/settings/token/rotate', { method: 'POST' });
-          state.settings.access_token = r.access_token;
-          toast('访问 Token 已重置', 'success');
+          await api('/api/settings/token/rotate', { method: 'POST' });
+          state.settings = null;
+          state.authed = false;
+          toast('访问 Token 已重置，请重新登录', 'success');
           render();
         } catch (err) {
           toast(err.message, 'danger');
@@ -3138,6 +3139,12 @@
       }
     });
     try {
+      if (state.route.startsWith('access-token=')) {
+        const token = new URLSearchParams(state.route).get('access-token');
+        state.route = '/';
+        history.replaceState(null, '', location.pathname + location.search);
+        if (token) await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ token }) });
+      }
       const st = await api('/api/auth/status');
       state.authed = st.authenticated;
       if (state.authed) await loadRouteData(state.route);
