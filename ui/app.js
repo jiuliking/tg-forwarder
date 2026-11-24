@@ -5,7 +5,7 @@
     sidebarOpen: false,
     theme: localStorage.getItem('tgfwd_theme') || 'system',
     overview: null,
-    logs: { items: [], rules: [], accounts: [], status: '', rule: '', account_id: '' },
+    logs: { items: [], rules: [], accounts: [], status: '', rule: '', account_id: '', page: 1, pageSize: 30, total: 0, totalPages: 1 },
     rules: [],
     accounts: [],
     ruleFilterAccount: '',
@@ -176,13 +176,18 @@
         state.chatTitles = state.overview.chat_titles || {};
       } else if (path === '/logs') {
         const qs = new URLSearchParams({
-          limit: '100',
+          page: String(state.logs.page || 1),
+          page_size: String(state.logs.pageSize || 30),
           status: state.logs.status,
           rule: state.logs.rule,
           account_id: state.logs.account_id,
         });
         const d = await api('/api/logs?' + qs.toString());
         state.logs.items = d.items || [];
+        state.logs.total = Number(d.total ?? state.logs.items.length);
+        state.logs.page = Number(d.page || 1);
+        state.logs.pageSize = Number(d.page_size || 30);
+        state.logs.totalPages = Number(d.total_pages || 1);
         state.logs.rules = d.rules || [];
         state.logs.accounts = d.accounts || [];
       } else if (path === '/rules') {
@@ -392,8 +397,27 @@
       </section>`;
   }
 
+  function buildPageNumbers(cur, total) {
+    if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+    const out = [1];
+    const left = Math.max(2, cur - 1);
+    const right = Math.min(total - 1, cur + 1);
+    if (left > 2) out.push('...');
+    for (let p = left; p <= right; p += 1) out.push(p);
+    if (right < total - 1) out.push('...');
+    out.push(total);
+    return out;
+  }
+
   function renderLogs() {
     const items = state.logs.items || [];
+    const total = Number(state.logs.total || 0);
+    const page = Number(state.logs.page || 1);
+    const pageSize = Number(state.logs.pageSize || 30);
+    const totalPages = Math.max(1, Number(state.logs.totalPages || 1));
+    const startIdx = total ? (page - 1) * pageSize + 1 : 0;
+    const endIdx = total ? Math.min(total, startIdx + items.length - 1) : 0;
+    const pageNums = buildPageNumbers(page, totalPages);
     return `
       <div class="page-head">
         <div>
@@ -467,6 +491,22 @@
             }
           </tbody>
         </table>
+      </div>
+      <div class="pagination-bar">
+        <div class="pagination-info">
+          ${total ? `第 ${startIdx}–${endIdx} 条 · 共 ${total} 条（第 ${page} / ${totalPages} 页）` : '共 0 条记录'}
+        </div>
+        <div class="pagination-controls">
+          <button type="button" class="btn small" data-log-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+          ${pageNums
+            .map((p) =>
+              p === '...'
+                ? '<span class="pagination-ellipsis">…</span>'
+                : `<button type="button" class="btn small ${p === page ? 'primary' : ''}" data-log-page="${p}" ${p === page ? 'aria-current="page"' : ''}>${p}</button>`
+            )
+            .join('')}
+          <button type="button" class="btn small" data-log-page="${page + 1}" ${page >= totalPages ? 'disabled' : ''}>下一页</button>
+        </div>
       </div>`;
   }
 
@@ -1623,11 +1663,19 @@
     });
 
     const logAcct = document.getElementById('log-filter-account');
-    if (logAcct) logAcct.onchange = () => { state.logs.account_id = logAcct.value; loadRouteData('/logs'); };
+    if (logAcct) logAcct.onchange = () => { state.logs.account_id = logAcct.value; state.logs.page = 1; loadRouteData('/logs'); };
     const logSt = document.getElementById('log-filter-status');
-    if (logSt) logSt.onchange = () => { state.logs.status = logSt.value; loadRouteData('/logs'); };
+    if (logSt) logSt.onchange = () => { state.logs.status = logSt.value; state.logs.page = 1; loadRouteData('/logs'); };
     const logRl = document.getElementById('log-filter-rule');
-    if (logRl) logRl.onchange = () => { state.logs.rule = logRl.value; loadRouteData('/logs'); };
+    if (logRl) logRl.onchange = () => { state.logs.rule = logRl.value; state.logs.page = 1; loadRouteData('/logs'); };
+    document.querySelectorAll('[data-log-page]').forEach((b) => {
+      b.onclick = () => {
+        const p = Number(b.dataset.logPage);
+        if (!Number.isFinite(p) || p < 1 || p === state.logs.page || p > state.logs.totalPages) return;
+        state.logs.page = p;
+        loadRouteData('/logs');
+      };
+    });
 
     const chatsAcct = document.getElementById('chats-acct-select');
     if (chatsAcct) {

@@ -581,7 +581,14 @@ class HistoryStore:
             "db_size_bytes": db_size,
         }
 
-    def recent(self, limit: int = 50, status: str = "", rule: str = "", account_id: str = "") -> list[dict[str, Any]]:
+    def recent(
+        self,
+        limit: int = 50,
+        status: str = "",
+        rule: str = "",
+        account_id: str = "",
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
         if status:
@@ -594,11 +601,50 @@ class HistoryStore:
             clauses.append("account_id = ?")
             params.append(account_id)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        params.append(max(1, min(limit, 500)))
+        lim = max(1, min(limit, 500))
+        off = max(0, int(offset))
         rows = self.conn.execute(
-            f"SELECT * FROM history {where} ORDER BY id DESC LIMIT ?", params
+            f"SELECT * FROM history {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, lim, off],
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def query_page(
+        self,
+        page: int = 1,
+        page_size: int = 30,
+        status: str = "",
+        rule: str = "",
+        account_id: str = "",
+    ) -> dict[str, Any]:
+        clauses = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if rule:
+            clauses.append("rule_name = ?")
+            params.append(rule)
+        if account_id:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        total = int(self.conn.execute(f"SELECT COUNT(*) FROM history {where}", params).fetchone()[0] or 0)
+        size = max(1, min(int(page_size), 200))
+        total_pages = max(1, (total + size - 1) // size)
+        cur_page = max(1, min(int(page), total_pages))
+        offset = (cur_page - 1) * size
+        rows = self.conn.execute(
+            f"SELECT * FROM history {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, size, offset],
+        ).fetchall()
+        return {
+            "items": [dict(r) for r in rows],
+            "total": total,
+            "page": cur_page,
+            "page_size": size,
+            "total_pages": total_pages,
+        }
 
     def stats_and_activity(self) -> dict[str, Any]:
         now = int(time.time())

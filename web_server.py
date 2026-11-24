@@ -320,15 +320,25 @@ class WebConsole:
         )
 
     async def handle_logs(self, request: web.Request) -> web.Response:
-        limit = int(request.query.get("limit", "100"))
+        try:
+            page = int(request.query.get("page", "1"))
+        except ValueError:
+            page = 1
+        raw_size = request.query.get("page_size") or request.query.get("limit") or "30"
+        try:
+            page_size = int(raw_size)
+        except ValueError:
+            page_size = 30
         status = request.query.get("status", "").strip()
         rule = request.query.get("rule", "").strip()
         account_id = request.query.get("account_id", "").strip()
-        rows = self.manager.history.recent(limit=limit, status=status, rule=rule, account_id=account_id)
+        res = self.manager.history.query_page(
+            page=page, page_size=page_size, status=status, rule=rule, account_id=account_id
+        )
         raw = load_raw_config(self.config_path)
         rule_names = [str(r.get("name") or f"rule-{i+1}") for i, r in enumerate(raw.get("rules") or [])]
         accounts = [{"id": a["id"], "name": a["name"]} for a in (raw.get("accounts") or [])]
-        return web.json_response({"items": rows, "rules": rule_names, "accounts": accounts})
+        return web.json_response({**res, "rules": rule_names, "accounts": accounts})
 
     async def handle_logs_manage_get(self, _request: web.Request) -> web.Response:
         raw = load_raw_config(self.config_path)

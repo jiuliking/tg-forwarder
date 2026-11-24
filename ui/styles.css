@@ -373,6 +373,13 @@ html[data-theme='dark'] .btn.primary:hover:not(:disabled) { background: #ffffff;
 }
 
 .table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); }
+.pagination-bar {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+}
+.pagination-info { color: var(--text-3); font-size: 13px; font-variant-numeric: tabular-nums; }
+.pagination-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.pagination-ellipsis { padding: 0 4px; color: var(--text-3); font-size: 13px; }
 table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 14px; }
 th {
   padding: 11px 16px; color: var(--text-3); background: var(--surface-muted);

@@ -184,9 +184,37 @@ def test_stores_and_config_roundtrip() -> None:
         assert mixed == [["p1"], ["d1", "d2"], ["p2"]]
 
 
+def test_history_pagination() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        h = HistoryStore(Path(td) / "state.db")
+        for i in range(1, 66):
+            h.record(
+                rule_name="r1" if i % 2 else "r2",
+                source_id=-1001,
+                source_title="S",
+                target_id=-1002,
+                target_title="T",
+                msg_id=i,
+                item_count=1,
+                mode="copy",
+                status="success" if i % 3 else "skipped",
+                preview=f"p{i}",
+            )
+        p1 = h.query_page(page=1, page_size=30)
+        assert p1["total"] == 65 and p1["total_pages"] == 3 and p1["page"] == 1
+        assert len(p1["items"]) == 30 and p1["items"][0]["msg_id"] == 65 and p1["items"][-1]["msg_id"] == 36
+        p3 = h.query_page(page=3, page_size=30)
+        assert len(p3["items"]) == 5 and p3["items"][0]["msg_id"] == 5 and p3["items"][-1]["msg_id"] == 1
+        clamped = h.query_page(page=99, page_size=30)
+        assert clamped["page"] == 3 and len(clamped["items"]) == 5
+        filtered = h.query_page(page=1, page_size=30, status="skipped", rule="r1")
+        assert filtered["total"] == len([i for i in range(1, 66) if i % 2 and i % 3 == 0])
+
+
 if __name__ == "__main__":
     test_clean_preserves_utf16_entities()
     test_strip_all_text_still_runs_skip_filter()
     test_unchanged_text_returns_false()
     test_stores_and_config_roundtrip()
+    test_history_pagination()
     print("ALL TESTS PASSED")
