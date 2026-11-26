@@ -781,6 +781,21 @@ class DedupStore:
                 PRIMARY KEY (account_id, source_id)
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS reupload_relays (
+                account_id TEXT NOT NULL,
+                source_id INTEGER NOT NULL,
+                item_kind TEXT NOT NULL,
+                item_id INTEGER NOT NULL,
+                relay_chat_id INTEGER NOT NULL,
+                relay_msg_id INTEGER NOT NULL,
+                caption_text TEXT NOT NULL DEFAULT '',
+                entities_sig TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (account_id, source_id, item_kind, item_id)
+            )
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_reupload_relays_ts ON reupload_relays(created_at)")
         old_exists = self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='forwarded'"
         ).fetchone()
@@ -815,7 +830,95 @@ class DedupStore:
     def prune(self, ttl_hours: int) -> None:
         cutoff = int(time.time()) - max(1, ttl_hours) * 3600
         self.conn.execute("DELETE FROM forwarded_v2 WHERE created_at < ?", (cutoff,))
+        self.conn.execute("DELETE FROM reupload_relays WHERE created_at < ?", (cutoff,))
         self.conn.commit()
+
+    def get_reupload_relays(
+        self,
+        source_id: int,
+        items: Sequence[tuple[str, int]],
+        account_id: str = "default",
+    ) -> dict[tuple[str, int], dict[str, Any]]:
+        unique_items = list(dict.fromkeys((str(kind), int(item_id)) for kind, item_id in items))
+        if not unique_items:
+            return {}
+        out: dict[tuple[str, int], dict[str, Any]] = {}
+        item_set = set(unique_items)
+        item_ids = sorted({item_id for _, item_id in unique_items})
+        placeholders = ",".join("?" for _ in item_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT item_kind, item_id, relay_chat_id, relay_msg_id, caption_text, entities_sig, created_at
+            FROM reupload_relays
+            WHERE account_id=? AND source_id=? AND item_id IN ({placeholders})
+            """,
+            [account_id, int(source_id), *item_ids],
+        ).fetchall()
+        for row in rows:
+            key = (str(row[0]), int(row[1]))
+            if key in item_set:
+                out[key] = {
+                    "item_kind": key[0],
+                    "item_id": key[1],
+                    "relay_chat_id": int(row[2]),
+                    "relay_msg_id": int(row[3]),
+                    "caption_text": str(row[4] or ""),
+                    "entities_sig": str(row[5] or ""),
+                    "created_at": int(row[6]),
+                }
+        return out
+
+    def set_reupload_relays(
+        self,
+        source_id: int,
+        entries: Sequence[tuple[str, int, int, int, str, str]],
+        account_id: str = "default",
+    ) -> None:
+        if not entries:
+            return
+        now = int(time.time())
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO reupload_relays
+                (account_id, source_id, item_kind, item_id, relay_chat_id, relay_msg_id, caption_text, entities_sig, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        account_id,
+                        int(source_id),
+                        str(kind),
+                        int(item_id),
+                        int(relay_chat_id),
+                        int(relay_msg_id),
+                        str(caption_text or ""),
+                        str(entities_sig or ""),
+                        now,
+                    )
+                    for kind, item_id, relay_chat_id, relay_msg_id, caption_text, entities_sig in entries
+                ),
+            )
+
+    def delete_reupload_relay(
+        self,
+        source_id: int,
+        item_kind: str,
+        item_id: int,
+        account_id: str = "default",
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM reupload_relays WHERE account_id=? AND source_id=? AND item_kind=? AND item_id=?",
+                (account_id, int(source_id), str(item_kind), int(item_id)),
+            )
+
+    def delete_reupload_relays_for_chat(self, relay_chat_id: int, account_id: str = "default") -> None:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM reupload_relays WHERE account_id=? AND relay_chat_id=?",
+                (account_id, int(relay_chat_id)),
+            )
 
     def delivery_parts(self, key: tuple[str, int, int, int, str]) -> set[str]:
         rows = self.conn.execute(

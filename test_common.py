@@ -492,6 +492,40 @@ def test_regex_library_and_web_crud() -> None:
         asyncio.run(_run())
 
 
+def test_dedup_reupload_relays_crud_and_prune() -> None:
+    import time
+
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "state.db"
+        dedup = DedupStore(db_path)
+        dedup.set_reupload_relays(
+            -1001,
+            [
+                ("main", 10, -1002, 200, "hello", "sig1"),
+                ("reply", 10, -1002, 201, "reply", ""),
+            ],
+            account_id="default",
+        )
+        got = dedup.get_reupload_relays(-1001, [("main", 10), ("reply", 10)], account_id="default")
+        assert got[("main", 10)]["relay_chat_id"] == -1002
+        assert got[("main", 10)]["relay_msg_id"] == 200
+        assert got[("reply", 10)]["relay_msg_id"] == 201
+
+        dedup.delete_reupload_relay(-1001, "main", 10, account_id="default")
+        assert ("main", 10) not in dedup.get_reupload_relays(-1001, [("main", 10)], account_id="default")
+        assert ("reply", 10) in dedup.get_reupload_relays(-1001, [("reply", 10)], account_id="default")
+
+        dedup.delete_reupload_relays_for_chat(-1002, account_id="default")
+        assert dedup.get_reupload_relays(-1001, [("reply", 10)], account_id="default") == {}
+
+        dedup.set_reupload_relays(-1001, [("main", 11, -1002, 202, "", "")], account_id="default")
+        with dedup.conn:
+            dedup.conn.execute("UPDATE reupload_relays SET created_at = ?", (int(time.time()) - 7200,))
+        dedup.prune(1)
+        assert dedup.get_reupload_relays(-1001, [("main", 11)], account_id="default") == {}
+        dedup.conn.close()
+
+
 if __name__ == "__main__":
     test_clean_preserves_utf16_entities()
     test_strip_all_text_still_runs_skip_filter()
@@ -506,4 +540,5 @@ if __name__ == "__main__":
     test_history_pagination()
     test_history_resend_status_annotation()
     test_regex_library_and_web_crud()
+    test_dedup_reupload_relays_crud_and_prune()
     print("ALL TESTS PASSED")

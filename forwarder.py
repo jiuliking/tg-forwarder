@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -8,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from aiohttp import web
 from telethon import TelegramClient, events, utils
@@ -124,6 +126,9 @@ class AccountRunner:
         self._auth_lock = asyncio.Lock()
         self._reupload_sem = asyncio.Semaphore(2)
         self._inflight_deliveries: set[tuple[int, int, int]] = set()
+        self._relay_inflight: dict[tuple[int, str, int], asyncio.Event] = {}
+        self._relay_msg_cache: dict[tuple[int, int], Any] = {}
+        self.target_noforwards: dict[int, bool] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._pending_albums: dict[tuple[int, int], PendingAlbum] = {}
         self._handlers_attached = False
@@ -485,6 +490,7 @@ class AccountRunner:
                             ent = await self.client.get_entity(tgt)
                             peer_id = utils.get_peer_id(ent)
                             self.chat_titles[peer_id] = self._entity_title(ent, tgt)
+                            self._get_target_noforwards_map()[peer_id] = bool(getattr(ent, "noforwards", False))
                             new_target_cache[tgt] = await self.client.get_input_entity(ent)
                         except Exception as exc:
                             log.warning("[%s] Cannot resolve target %r in rule %r: %s", self.account_name, tgt, rule.name, exc)
@@ -638,6 +644,424 @@ class AccountRunner:
             inflight = self._inflight_deliveries = set()
         return inflight
 
+    def _get_target_noforwards_map(self) -> dict[int, bool]:
+        m = getattr(self, "target_noforwards", None)
+        if m is None:
+            m = self.target_noforwards = {}
+        return m
+
+    def _get_relay_inflight(self) -> dict[tuple[int, str, int], asyncio.Event]:
+        m = getattr(self, "_relay_inflight", None)
+        if m is None:
+            m = self._relay_inflight = {}
+        return m
+
+    def _get_relay_msg_cache(self) -> dict[tuple[int, int], Any]:
+        m = getattr(self, "_relay_msg_cache", None)
+        if m is None:
+            m = self._relay_msg_cache = {}
+        return m
+
+    def _cache_relay_msg(self, chat_id: int, msg_obj: Any) -> None:
+        mid = getattr(msg_obj, "id", None)
+        if not isinstance(mid, int) or mid <= 0 or getattr(msg_obj, "media", None) is None:
+            return
+        cache = self._get_relay_msg_cache()
+        key = (int(chat_id), mid)
+        cache.pop(key, None)
+        cache[key] = msg_obj
+        while len(cache) > 2000:
+            cache.pop(next(iter(cache)), None)
+
+    def _get_cached_relay_msg(self, chat_id: int, msg_id: int) -> Any:
+        return self._get_relay_msg_cache().get((int(chat_id), int(msg_id)))
+
+    @staticmethod
+    def _entities_sig(entities: Optional[Sequence[Any]]) -> str:
+        if not entities:
+            return ""
+        parts = [
+            [
+                type(ent).__name__,
+                int(getattr(ent, "offset", 0) or 0),
+                int(getattr(ent, "length", 0) or 0),
+                getattr(ent, "url", None),
+                getattr(ent, "user_id", None),
+                getattr(ent, "language", None),
+                getattr(ent, "custom_emoji_id", None),
+            ]
+            for ent in entities
+        ]
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+    def _lookup_relays(
+        self, source_id: int, items: Sequence[tuple[str, int]], target_id: int
+    ) -> dict[tuple[str, int], dict[str, Any]]:
+        dedup: Any = getattr(getattr(self, "manager", None), "dedup", None)
+        getter: Any = getattr(dedup, "get_reupload_relays", None)
+        if not callable(getter) or not source_id or not target_id:
+            return {}
+        raw: Any = getter(source_id, items, account_id=self.account_id)
+        nofwd = self._get_target_noforwards_map()
+        return {
+            k: v
+            for k, v in raw.items()
+            if int(v["relay_chat_id"]) != int(target_id) and not nofwd.get(int(v["relay_chat_id"]), False)
+        }
+
+    def _save_relays(
+        self,
+        source_id: int,
+        entries: Sequence[tuple[str, int, int, Any, str, Optional[Sequence[Any]]]],
+    ) -> None:
+        dedup = getattr(getattr(self, "manager", None), "dedup", None)
+        setter = getattr(dedup, "set_reupload_relays", None)
+        if not callable(setter) or not source_id:
+            return
+        nofwd = self._get_target_noforwards_map()
+        rows: list[tuple[str, int, int, int, str, str]] = []
+        for kind, item_id, relay_chat_id, sent_msg, cap, ents in entries:
+            if nofwd.get(int(relay_chat_id), False):
+                continue
+            relay_msg_id = getattr(sent_msg, "id", None)
+            if not isinstance(relay_msg_id, int) or relay_msg_id <= 0:
+                continue
+            self._cache_relay_msg(relay_chat_id, sent_msg)
+            rows.append((kind, int(item_id), int(relay_chat_id), relay_msg_id, cap or "", self._entities_sig(ents)))
+        if rows:
+            setter(source_id, rows, account_id=self.account_id)
+
+    def _invalidate_relays(
+        self,
+        source_id: int,
+        items: Sequence[tuple[str, int]],
+        *,
+        restricted_chat_id: Optional[int] = None,
+    ) -> None:
+        dedup = getattr(getattr(self, "manager", None), "dedup", None)
+        if restricted_chat_id is not None:
+            self._get_target_noforwards_map()[int(restricted_chat_id)] = True
+            deleter_chat = getattr(dedup, "delete_reupload_relays_for_chat", None)
+            if callable(deleter_chat):
+                deleter_chat(int(restricted_chat_id), account_id=self.account_id)
+            return
+        deleter = getattr(dedup, "delete_reupload_relay", None)
+        if callable(deleter) and source_id:
+            for kind, item_id in items:
+                deleter(source_id, kind, int(item_id), account_id=self.account_id)
+
+    async def _wait_inflight_relays(self, source_id: int, items: Sequence[tuple[str, int]]) -> None:
+        if not source_id:
+            return
+        inflight = self._get_relay_inflight()
+        while True:
+            events = [inflight[(int(source_id), kind, int(mid))] for kind, mid in items if (int(source_id), kind, int(mid)) in inflight]
+            if not events:
+                return
+            try:
+                await asyncio.wait_for(asyncio.gather(*(ev.wait() for ev in events)), timeout=600)
+            except TimeoutError:
+                return
+
+    def _claim_inflight_relays(
+        self, source_id: int, items: Sequence[tuple[str, int]]
+    ) -> list[tuple[tuple[int, str, int], asyncio.Event]]:
+        if not source_id:
+            return []
+        inflight = self._get_relay_inflight()
+        claimed: list[tuple[tuple[int, str, int], asyncio.Event]] = []
+        for kind, mid in items:
+            key = (int(source_id), str(kind), int(mid))
+            if key not in inflight:
+                ev = asyncio.Event()
+                inflight[key] = ev
+                claimed.append((key, ev))
+        return claimed
+
+    def _release_inflight_relays(self, claimed: list[tuple[tuple[int, str, int], asyncio.Event]]) -> None:
+        inflight = self._get_relay_inflight()
+        for key, ev in claimed:
+            if inflight.get(key) is ev:
+                inflight.pop(key, None)
+            ev.set()
+
+    async def _resolve_relay_entity(self, relay_chat_id: int) -> Any:
+        cached = self.target_cache.get(relay_chat_id)
+        if cached is not None:
+            return cached
+        get_entity: Any = getattr(self.client, "get_entity", None)
+        if callable(get_entity):
+            try:
+                ent = await get_entity(relay_chat_id)
+                if ent is not None and bool(getattr(ent, "noforwards", False)):
+                    self._get_target_noforwards_map()[int(relay_chat_id)] = True
+                    return None
+                return ent
+            except Exception:
+                return None
+        return None
+
+    async def _resolve_relay_media_msgs(
+        self,
+        relay_ent: Any,
+        relay_chat_id: int,
+        relay_msg_ids: Sequence[int],
+    ) -> Optional[list[Any]]:
+        resolved: dict[int, Any] = {}
+        missing: list[int] = []
+        for rmid in relay_msg_ids:
+            cached = self._get_cached_relay_msg(relay_chat_id, rmid)
+            if cached is not None and getattr(cached, "media", None) is not None:
+                resolved[rmid] = cached
+            else:
+                missing.append(rmid)
+        if missing:
+            get_msgs = getattr(self.client, "get_messages", None)
+            if not callable(get_msgs):
+                return None
+            fetched = await self._call_with_flood_retry(
+                lambda: get_msgs(relay_ent, ids=missing[0] if len(missing) == 1 else missing)
+            )
+            fetched_list = fetched if isinstance(fetched, list) else ([fetched] if fetched is not None else [])
+            for m in fetched_list:
+                if m is not None and isinstance(getattr(m, "id", None), int) and getattr(m, "media", None) is not None:
+                    self._cache_relay_msg(relay_chat_id, m)
+                    resolved[int(m.id)] = m
+        if any(rmid not in resolved for rmid in relay_msg_ids):
+            return None
+        return [resolved[rmid] for rmid in relay_msg_ids]
+
+    async def _relay_single_from_target(
+        self,
+        source_id: int,
+        item_kind: str,
+        item_id: int,
+        relay: dict[str, Any],
+        target_ent: Any,
+        caption: str,
+        entities: Optional[list[Any]],
+        clear_caption: bool,
+        *,
+        lock_send: bool = False,
+        sleep_after: float = 0.0,
+    ) -> tuple[Optional[str], Any]:
+        relay_chat_id = int(relay["relay_chat_id"])
+        relay_msg_id = int(relay["relay_msg_id"])
+        relay_ent = await self._resolve_relay_entity(relay_chat_id)
+        if relay_ent is None:
+            self._invalidate_relays(source_id, [(item_kind, item_id)])
+            return None, None
+
+        safe_cap, safe_ents = truncate_text_with_entities(caption, entities, 1024)
+        relay_cap = str(relay.get("caption_text") or "")
+        relay_sig = str(relay.get("entities_sig") or "")
+        same_caption = (safe_cap == relay_cap) and (self._entities_sig(safe_ents) == relay_sig)
+        drop_cap = clear_caption or ((not safe_cap) and bool(relay_cap))
+
+        try:
+            if same_caption or drop_cap:
+                mode_used = "cleaned" if (drop_cap and bool(relay_cap)) else "copy"
+
+                async def _do_relay_copy() -> Any:
+                    return await self._call_with_flood_retry(
+                        lambda: self.client.forward_messages(
+                            target_ent,
+                            relay_msg_id,
+                            relay_ent,
+                            drop_author=True,
+                            drop_media_captions=drop_cap and bool(relay_cap),
+                        )
+                    )
+
+                if lock_send:
+                    async with self._send_lock:
+                        sent = await _do_relay_copy()
+                        if sleep_after > 0:
+                            await asyncio.sleep(sleep_after)
+                else:
+                    sent = await _do_relay_copy()
+                if sent is None:
+                    self._invalidate_relays(source_id, [(item_kind, item_id)])
+                    return None, None
+                sent_obj = sent[0] if isinstance(sent, list) else sent
+                if sent_obj is None:
+                    self._invalidate_relays(source_id, [(item_kind, item_id)])
+                    return None, None
+                return mode_used, sent_obj
+
+            relay_msgs = await self._resolve_relay_media_msgs(relay_ent, relay_chat_id, [relay_msg_id])
+            if not relay_msgs:
+                self._invalidate_relays(source_id, [(item_kind, item_id)])
+                return None, None
+
+            async def _do_relay_send() -> Any:
+                return await self._call_with_flood_retry(
+                    lambda: self.client.send_file(
+                        target_ent,
+                        relay_msgs[0].media,
+                        caption=safe_cap,
+                        formatting_entities=safe_ents,
+                    )
+                )
+
+            if lock_send:
+                async with self._send_lock:
+                    sent = await _do_relay_send()
+                    if sleep_after > 0:
+                        await asyncio.sleep(sleep_after)
+            else:
+                sent = await _do_relay_send()
+            if sent is None:
+                self._invalidate_relays(source_id, [(item_kind, item_id)])
+                return None, None
+            return "cleaned", sent
+        except ChatForwardsRestrictedError:
+            self._invalidate_relays(source_id, [(item_kind, item_id)], restricted_chat_id=relay_chat_id)
+            return None, None
+        except MsgIdInvalidError:
+            self._invalidate_relays(source_id, [(item_kind, item_id)])
+            return None, None
+        except RPCError as exc:
+            msg_upper = str(exc).upper()
+            if "FORWARDS" in msg_upper:
+                self._invalidate_relays(source_id, [(item_kind, item_id)], restricted_chat_id=relay_chat_id)
+                return None, None
+            if "MESSAGE_ID_INVALID" in msg_upper:
+                self._invalidate_relays(source_id, [(item_kind, item_id)])
+                return None, None
+            raise
+
+    async def _relay_album_from_target(
+        self,
+        source_id: int,
+        items_keys: Sequence[tuple[str, int]],
+        relays: dict[tuple[str, int], dict[str, Any]],
+        target_ent: Any,
+        captions: Sequence[str],
+        entities_list: Sequence[Optional[list[Any]]],
+        clear_caption: bool,
+        *,
+        lock_send: bool = False,
+        sleep_after: float = 0.0,
+    ) -> tuple[Optional[str], set[int]]:
+        if not items_keys or any(k not in relays for k in items_keys):
+            return None, set()
+        relay_list = [relays[k] for k in items_keys]
+        relay_chat_ids = {int(r["relay_chat_id"]) for r in relay_list}
+        if len(relay_chat_ids) != 1:
+            return None, set()
+        relay_chat_id = next(iter(relay_chat_ids))
+        relay_ent = await self._resolve_relay_entity(relay_chat_id)
+        if relay_ent is None:
+            self._invalidate_relays(source_id, items_keys)
+            return None, set()
+
+        safe_caps: list[str] = []
+        safe_ents: list[list[Any]] = []
+        same_all = True
+        any_relay_cap = False
+        for idx, r in enumerate(relay_list):
+            raw_c = captions[idx] if idx < len(captions) else ""
+            raw_e = entities_list[idx] if idx < len(entities_list) else []
+            sc, se = truncate_text_with_entities(raw_c, raw_e, 1024)
+            safe_caps.append(sc)
+            safe_ents.append(se or [])
+            rcap = str(r.get("caption_text") or "")
+            if rcap:
+                any_relay_cap = True
+            if sc != rcap or self._entities_sig(se) != str(r.get("entities_sig") or ""):
+                same_all = False
+
+        drop_all_caps = clear_caption or (not any(safe_caps) and any_relay_cap)
+        relay_msg_ids = [int(r["relay_msg_id"]) for r in relay_list]
+
+        try:
+            if same_all or drop_all_caps:
+                mode_used = "cleaned" if (drop_all_caps and any_relay_cap) else "copy"
+
+                async def _do_album_relay_copy() -> Any:
+                    return await self._call_with_flood_retry(
+                        lambda: self.client.forward_messages(
+                            target_ent,
+                            relay_msg_ids,
+                            relay_ent,
+                            drop_author=True,
+                            drop_media_captions=drop_all_caps and any_relay_cap,
+                        )
+                    )
+
+                if lock_send:
+                    async with self._send_lock:
+                        sent = await _do_album_relay_copy()
+                        if sent and sleep_after > 0:
+                            await asyncio.sleep(sleep_after)
+                else:
+                    sent = await _do_album_relay_copy()
+                sent_list = sent if isinstance(sent, list) else ([sent] if sent is not None else [])
+                indexes = {idx for idx, result in enumerate(sent_list) if result is not None}
+                if not indexes:
+                    self._invalidate_relays(source_id, items_keys)
+                    return None, set()
+                return mode_used, indexes
+
+            relay_msgs = await self._resolve_relay_media_msgs(relay_ent, relay_chat_id, relay_msg_ids)
+            if not relay_msgs:
+                self._invalidate_relays(source_id, items_keys)
+                return None, set()
+
+            async def _do_album_relay_send() -> Any:
+                if len(relay_msgs) == 1:
+                    return await self._call_with_flood_retry(
+                        lambda: self.client.send_file(
+                            target_ent,
+                            relay_msgs[0].media,
+                            caption=safe_caps[0],
+                            formatting_entities=safe_ents[0] or None,
+                            supports_streaming=True,
+                        )
+                    )
+                return await self._call_with_flood_retry(
+                    lambda: self.client.send_file(
+                        target_ent,
+                        [rm.media for rm in relay_msgs],
+                        caption=safe_caps,
+                        formatting_entities=safe_ents,
+                        supports_streaming=True,
+                    )
+                )
+
+            if lock_send:
+                async with self._send_lock:
+                    sent = await _do_album_relay_send()
+                    if sent and sleep_after > 0:
+                        await asyncio.sleep(sleep_after)
+            else:
+                sent = await _do_album_relay_send()
+            if len(relay_msgs) == 1:
+                indexes = {0} if sent is not None else set()
+            else:
+                sent_list = sent if isinstance(sent, list) else []
+                indexes = {idx for idx, result in enumerate(sent_list) if result is not None}
+            if not indexes:
+                self._invalidate_relays(source_id, items_keys)
+                return None, set()
+            return "cleaned", indexes
+        except ChatForwardsRestrictedError:
+            self._invalidate_relays(source_id, items_keys, restricted_chat_id=relay_chat_id)
+            return None, set()
+        except MsgIdInvalidError:
+            self._invalidate_relays(source_id, items_keys)
+            return None, set()
+        except RPCError as exc:
+            msg_upper = str(exc).upper()
+            if "FORWARDS" in msg_upper:
+                self._invalidate_relays(source_id, items_keys, restricted_chat_id=relay_chat_id)
+                return None, set()
+            if "MESSAGE_ID_INVALID" in msg_upper:
+                self._invalidate_relays(source_id, items_keys)
+                return None, set()
+            raise
+
     async def _preupload_file(
         self,
         file_path: str,
@@ -669,15 +1093,16 @@ class AccountRunner:
         rule: CompiledRule,
         *,
         lock_send: bool = False,
-    ) -> bool:
+        sleep_after: float = 0.0,
+    ) -> tuple[bool, Any]:
         cfg = self.manager.cfg
         if not self._is_real_media(msg):
             if not (text or "").strip():
                 log.warning("Skip empty text-only restricted msg %s", msg.id)
-                return False
+                return False, None
 
-            async def _send_text() -> None:
-                await self._call_with_flood_retry(
+            async def _send_text() -> Any:
+                return await self._call_with_flood_retry(
                     lambda: self.client.send_message(
                         target_ent,
                         text,
@@ -688,15 +1113,17 @@ class AccountRunner:
 
             if lock_send:
                 async with self._send_lock:
-                    await _send_text()
+                    sent = await _send_text()
+                    if sleep_after > 0:
+                        await asyncio.sleep(sleep_after)
             else:
-                await _send_text()
-            return True
+                sent = await _send_text()
+            return True, sent
 
         size_mb = self._file_size_mb(msg)
         if size_mb > cfg.max_download_mb:
             log.warning("Skip restricted msg %s: size %.1fMB > max_download_mb %dMB", msg.id, size_mb, cfg.max_download_mb)
-            return False
+            return False, None
 
         cap, ents = truncate_text_with_entities(text, entities, 1024)
         work_dir = cfg.temp_dir / f"job_{uuid.uuid4().hex[:12]}"
@@ -708,7 +1135,7 @@ class AccountRunner:
                 )
                 if not file_path:
                     log.warning("Download returned empty for restricted msg %s", msg.id)
-                    return False
+                    return False, None
 
                 is_video, video_attrs = self._extract_video_attrs(msg)
                 thumb_path = None
@@ -724,9 +1151,9 @@ class AccountRunner:
                     thumb_path=thumb_path,
                 )
 
-            async def _send_media() -> None:
+            async def _send_media() -> Any:
                 if preuploaded:
-                    await self._call_with_flood_retry(
+                    return await self._call_with_flood_retry(
                         lambda: self.client.send_file(
                             target_ent,
                             prepared,
@@ -734,25 +1161,26 @@ class AccountRunner:
                             formatting_entities=ents,
                         )
                     )
-                else:
-                    await self._call_with_flood_retry(
-                        lambda: self.client.send_file(
-                            target_ent,
-                            file_path,
-                            caption=cap,
-                            formatting_entities=ents,
-                            supports_streaming=is_video,
-                            attributes=video_attrs,
-                            thumb=thumb_path,
-                        )
+                return await self._call_with_flood_retry(
+                    lambda: self.client.send_file(
+                        target_ent,
+                        file_path,
+                        caption=cap,
+                        formatting_entities=ents,
+                        supports_streaming=is_video,
+                        attributes=video_attrs,
+                        thumb=thumb_path,
                     )
+                )
 
             if lock_send:
                 async with self._send_lock:
-                    await _send_media()
+                    sent = await _send_media()
+                    if sleep_after > 0:
+                        await asyncio.sleep(sleep_after)
             else:
-                await _send_media()
-            return True
+                sent = await _send_media()
+            return True, sent
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -764,12 +1192,13 @@ class AccountRunner:
         entities_list: list[list[Any]],
         *,
         lock_send: bool = False,
-    ) -> set[int]:
+        sleep_after: float = 0.0,
+    ) -> dict[int, tuple[Any, str, list[Any]]]:
         cfg = self.manager.cfg
         total_mb = sum(self._file_size_mb(m) for m in msgs)
         if total_mb > cfg.max_download_mb:
             log.warning("Skip restricted album (%d items): total %.1fMB > %dMB", len(msgs), total_mb, cfg.max_download_mb)
-            return set()
+            return {}
 
         work_dir = cfg.temp_dir / f"album_{uuid.uuid4().hex[:12]}"
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -815,12 +1244,12 @@ class AccountRunner:
                         items.append((prepared, cap, ents or [], idx))
 
             if not items:
-                return set()
+                return {}
             if dropped_caption is not None and not any(item[1] for item in items):
                 m0, _, _, original_index = items[0]
                 items[0] = (m0, dropped_caption[0], dropped_caption[1], original_index)
 
-            async def _send_album_items() -> set[int]:
+            async def _send_album_items() -> dict[int, tuple[Any, str, list[Any]]]:
                 if len(items) == 1:
                     media0, cap0, ent0, original_index = items[0]
                     sent = await self._call_with_flood_retry(
@@ -832,7 +1261,7 @@ class AccountRunner:
                             supports_streaming=True,
                         )
                     )
-                    return {original_index} if sent is not None else set()
+                    return {original_index: (sent, cap0, ent0)} if sent is not None else {}
 
                 files_out = [x[0] for x in items]
                 caps_out = [x[1] for x in items]
@@ -846,11 +1275,18 @@ class AccountRunner:
                         supports_streaming=True,
                     )
                 )
-                return {item[3] for item, result in zip(items, sent or []) if result is not None}
+                return {
+                    item[3]: (result, item[1], item[2])
+                    for item, result in zip(items, sent or [])
+                    if result is not None
+                }
 
             if lock_send:
                 async with self._send_lock:
-                    return await _send_album_items()
+                    sent_map = await _send_album_items()
+                    if sent_map and sleep_after > 0:
+                        await asyncio.sleep(sleep_after)
+                return sent_map
             return await _send_album_items()
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1115,102 +1551,109 @@ class AccountRunner:
         total_media = sum(len(b) for b in all_batches)
         raw_preview = chosen_text or (f"[媒体 {total_media} 项]" if total_media else "[纯文字消息]")
 
-        async with self._send_lock:
+        if target_override is None:
             if not is_active():
                 return False, "规则已停用或修改"
-            if target_override is None:
-                filter_texts = [message.message or "" for message in main_msgs] if main_text_msg else [chosen_text]
-                skip_hit = next(((text, hit) for text in filter_texts
-                                 if (hit := should_skip_text(text, rule)) is not None), None)
-                if skip_hit is not None:
-                    matched_text, matched_skip = skip_hit
-                    log.info("[%s/%s] Skip post+comments %s (matched %r)", self.account_name, rule.name, lead_id, matched_skip)
-                    self.manager.history.record(
-                        account_id=self.account_id,
-                        account_name=self.account_name,
-                        rule_name=rule.name,
-                        source_id=source_id,
-                        source_title=source_title,
-                        target_id=0,
-                        target_title="-",
-                        msg_id=lead_id,
-                        item_count=max(1, total_media),
-                        mode="skip_regex",
-                        status="skipped",
-                        preview=raw_preview,
-                        detail=f"命中跳过正则: {matched_skip}",
-                        matched_terms=find_matched_regex_branches(matched_text, matched_skip),
-                    )
-                    return False, f"命中跳过正则: {matched_skip}"
+            filter_texts = [message.message or "" for message in main_msgs] if main_text_msg else [chosen_text]
+            skip_hit = next(((text, hit) for text in filter_texts
+                             if (hit := should_skip_text(text, rule)) is not None), None)
+            if skip_hit is not None:
+                matched_text, matched_skip = skip_hit
+                log.info("[%s/%s] Skip post+comments %s (matched %r)", self.account_name, rule.name, lead_id, matched_skip)
+                self.manager.history.record(
+                    account_id=self.account_id,
+                    account_name=self.account_name,
+                    rule_name=rule.name,
+                    source_id=source_id,
+                    source_title=source_title,
+                    target_id=0,
+                    target_title="-",
+                    msg_id=lead_id,
+                    item_count=max(1, total_media),
+                    mode="skip_regex",
+                    status="skipped",
+                    preview=raw_preview,
+                    detail=f"命中跳过正则: {matched_skip}",
+                    matched_terms=find_matched_regex_branches(matched_text, matched_skip),
+                )
+                return False, f"命中跳过正则: {matched_skip}"
 
-                if total_media == 0 and rule.skip_text_only:
-                    log.info("[%s/%s] Skip text-only msg %s (no media in comments)", self.account_name, rule.name, lead_id)
-                    self.manager.history.record(
-                        account_id=self.account_id,
-                        account_name=self.account_name,
-                        rule_name=rule.name,
-                        source_id=source_id,
-                        source_title=source_title,
-                        target_id=0,
-                        target_title="-",
-                        msg_id=lead_id,
-                        item_count=1,
-                        mode="skip_text_only",
-                        status="skipped",
-                        preview=raw_preview,
-                        detail="主帖与评论区均无媒体，已跳过纯文字消息",
-                    )
-                    return False, "主帖与评论区均无媒体"
+            if total_media == 0 and rule.skip_text_only:
+                log.info("[%s/%s] Skip text-only msg %s (no media in comments)", self.account_name, rule.name, lead_id)
+                self.manager.history.record(
+                    account_id=self.account_id,
+                    account_name=self.account_name,
+                    rule_name=rule.name,
+                    source_id=source_id,
+                    source_title=source_title,
+                    target_id=0,
+                    target_title="-",
+                    msg_id=lead_id,
+                    item_count=1,
+                    mode="skip_text_only",
+                    status="skipped",
+                    preview=raw_preview,
+                    detail="主帖与评论区均无媒体，已跳过纯文字消息",
+                )
+                return False, "主帖与评论区均无媒体"
 
-            clear_caption = rule.strip_all_text or (should_strip_all_text(chosen_text, rule) is not None)
-            if clear_caption:
-                cleaned_text, cleaned_entities = "", None
-            else:
-                cleaned_text, cleaned_entities, _ = clean_message_text(chosen_text, chosen_entities, rule)
+        if not is_active():
+            return False, "规则已停用或修改"
+        clear_caption = rule.strip_all_text or (should_strip_all_text(chosen_text, rule) is not None)
+        if clear_caption:
+            cleaned_text, cleaned_entities = "", None
+        else:
+            cleaned_text, cleaned_entities, _ = clean_message_text(chosen_text, chosen_entities, rule)
 
-            if total_media == 0 and not cleaned_text.strip():
-                if target_override is not None:
-                    return False, "清洗后为空文本，无法发送"
-                if rule.skip_empty_text_only or clear_caption:
-                    self.manager.history.record(
-                        account_id=self.account_id,
-                        account_name=self.account_name,
-                        rule_name=rule.name,
-                        source_id=source_id,
-                        source_title=source_title,
-                        target_id=0,
-                        target_title="-",
-                        msg_id=lead_id,
-                        item_count=1,
-                        mode="skip_empty",
-                        status="skipped",
-                        preview=raw_preview,
-                        detail="清洗后为空文本",
-                    )
-                    return False, "清洗后为空文本"
+        if total_media == 0 and not cleaned_text.strip():
+            if target_override is not None:
                 return False, "清洗后为空文本，无法发送"
+            if rule.skip_empty_text_only or clear_caption:
+                self.manager.history.record(
+                    account_id=self.account_id,
+                    account_name=self.account_name,
+                    rule_name=rule.name,
+                    source_id=source_id,
+                    source_title=source_title,
+                    target_id=0,
+                    target_title="-",
+                    msg_id=lead_id,
+                    item_count=1,
+                    mode="skip_empty",
+                    status="skipped",
+                    preview=raw_preview,
+                    detail="清洗后为空文本",
+                )
+                return False, "清洗后为空文本"
+            return False, "清洗后为空文本，无法发送"
 
-            if album_id is not None and main_media:
-                chunks = build_media_chunks([main_media], "keep_batches", self._media_bucket)
-                chunks += build_media_chunks(comment_batches, rule.comment_merge_mode, self._media_bucket)
-            else:
-                chunks = build_media_chunks(all_batches, rule.comment_merge_mode, self._media_bucket)
-            clean_preview = cleaned_text or (f"[评论区合并 {total_media} 项]" if comment_batches else f"[媒体 {total_media} 项]")
+        if album_id is not None and main_media:
+            chunks = build_media_chunks([main_media], "keep_batches", self._media_bucket)
+            chunks += build_media_chunks(comment_batches, rule.comment_merge_mode, self._media_bucket)
+        else:
+            chunks = build_media_chunks(all_batches, rule.comment_merge_mode, self._media_bucket)
+        clean_preview = cleaned_text or (f"[评论区合并 {total_media} 项]" if comment_batches else f"[媒体 {total_media} 项]")
 
-            target_list = targets()
+        target_list = targets()
 
-            last_ok = False
-            last_msg = "无可用目标频道"
-            for target_ent, target_id, target_title in target_list:
-                if not is_active():
-                    return False, "规则已停用或修改"
-                key = (self.account_id, source_id, lead_id, target_id, delivery_key)
-                delivered = self.manager.dedup.delivery_parts(key)
-                try:
-                    has_standalone_text = not total_media or utf16_len(cleaned_text) > 1024
-                    if has_standalone_text and "text" not in delivered:
-                        if not rule.fallback_reupload and self._is_noforwards(chat, main_msgs):
-                            raise ValueError("源频道禁止转发且未启用重传")
+        last_ok = False
+        last_msg = "无可用目标频道"
+        inflight = self._get_inflight_deliveries()
+        for target_ent, target_id, target_title in target_list:
+            if not is_active():
+                return False, "规则已停用或修改"
+            inflight_key = (source_id, lead_id, target_id)
+            if inflight_key in inflight:
+                continue
+            inflight.add(inflight_key)
+            key = (self.account_id, source_id, lead_id, target_id, delivery_key)
+            delivered = self.manager.dedup.delivery_parts(key)
+            try:
+                has_standalone_text = not total_media or utf16_len(cleaned_text) > 1024
+                if has_standalone_text and "text" not in delivered:
+                    if not rule.fallback_reupload and self._is_noforwards(chat, main_msgs):
+                        raise ValueError("源频道禁止转发且未启用重传")
+                    async with self._send_lock:
                         sent = await self._call_with_flood_retry(
                             lambda: self.client.send_message(
                                 target_ent, cleaned_text, formatting_entities=cleaned_entities,
@@ -1220,89 +1663,107 @@ class AccountRunner:
                         )
                         if sent is None:
                             raise RuntimeError("Telegram 未确认文本发送")
-                        self.manager.dedup.mark_delivery_parts(key, ["text"])
-                        delivered.add("text")
-                        if total_media:
-                            await asyncio.sleep(min(1.5, max(0.5, self.manager.cfg.delay_seconds or 1.0)))
+                        if not total_media and self.manager.cfg.delay_seconds > 0:
+                            await asyncio.sleep(self.manager.cfg.delay_seconds)
+                    self.manager.dedup.mark_delivery_parts(key, ["text"])
+                    delivered.add("text")
+                    if total_media:
+                        await asyncio.sleep(min(1.5, max(0.5, self.manager.cfg.delay_seconds or 1.0)))
 
-                    sent_chunks = 0
-                    for chunk in chunks:
-                        pending = [(m, media_key(m)) for m in chunk if media_key(m) not in delivered]
-                        if not pending:
-                            continue
-                        if sent_chunks:
-                            await asyncio.sleep(min(2.0, max(0.8, self.manager.cfg.delay_seconds or 1.0)))
-                        if not is_active():
-                            return False, "规则已停用或修改"
-                        cap, ents = "", None
-                        if not has_standalone_text and "caption" not in delivered:
-                            cap, ents = truncate_text_with_entities(cleaned_text, cleaned_entities, 1024)
-                        sent_indexes, caption_sent = await self._deliver_comment_chunk(
-                            chat, target_ent, [m for m, _ in pending], cap, ents, rule,
-                        )
-                        parts = {pending[idx][1] for idx in sent_indexes}
-                        if caption_sent:
-                            parts.add("caption")
-                        self.manager.dedup.mark_delivery_parts(key, parts)
-                        delivered.update(parts)
-                        if len(sent_indexes) != len(pending):
-                            raise RuntimeError(f"评论组发送不完整：本次确认发送 {len(sent_indexes)}/{len(pending)} 项")
-                        sent_chunks += 1
-                    self.manager.dedup.mark_many(
-                        source_id, {lead_id, *(msg.id for msg in main_msgs)}, target_id, account_id=self.account_id,
-                    )
-                    cmt_note = f"含评论区媒体 {sum(len(b) for b in comment_batches)} 项（{len(chunks)} 组）" if comment_batches else ""
-                    detail_txt = " · ".join(p for p in [detail_prefix, cmt_note] if p)
-                    self.manager.history.record(
-                        account_id=self.account_id,
-                        account_name=self.account_name,
-                        rule_name=rule.name,
+                pending_chunks = [
+                    pending
+                    for chunk in chunks
+                    if (pending := [(m, media_key(m)) for m in chunk if media_key(m) not in delivered])
+                ]
+                used_relay_any = False
+                for c_idx, pending in enumerate(pending_chunks):
+                    if c_idx > 0:
+                        await asyncio.sleep(min(2.0, max(0.8, self.manager.cfg.delay_seconds or 1.0)))
+                    if not is_active():
+                        return False, "规则已停用或修改"
+                    cap, ents = "", None
+                    if not has_standalone_text and "caption" not in delivered:
+                        cap, ents = truncate_text_with_entities(cleaned_text, cleaned_entities, 1024)
+                    is_last_chunk = c_idx == len(pending_chunks) - 1
+                    sleep_after = self.manager.cfg.delay_seconds if is_last_chunk else 0.0
+                    sent_indexes, caption_sent, used_relay = await self._deliver_comment_chunk(
+                        chat,
+                        target_ent,
+                        [m for m, _ in pending],
+                        cap,
+                        ents,
+                        rule,
                         source_id=source_id,
-                        source_title=source_title,
                         target_id=target_id,
-                        target_title=target_title,
-                        msg_id=lead_id,
-                        item_count=max(1, total_media),
-                        mode=mode,
-                        status="success",
-                        delivery_key=delivery_key, rule_id=rule.id, album_group_id=group_id,
-                        preview=clean_preview,
-                        detail=detail_txt,
+                        main_objects=main_objects,
+                        lock_send=True,
+                        sleep_after=sleep_after,
                     )
-                    log.info(
-                        "[%s/%s] Forwarded post %s (+%d comment items in %d chunks, %s -> %s, mode=%s)",
-                        self.account_name,
-                        rule.name,
-                        lead_id,
-                        sum(len(b) for b in comment_batches),
-                        len(chunks),
-                        source_id,
-                        target_id,
-                        mode,
-                    )
-                    last_ok, last_msg = True, mode
-                except Exception as exc:
-                    log.exception("[%s/%s] Failed post+comments %s -> %s: %s", self.account_name, rule.name, lead_id, target_id, exc)
-                    self.manager.history.record(
-                        account_id=self.account_id,
-                        account_name=self.account_name,
-                        rule_name=rule.name,
-                        source_id=source_id,
-                        source_title=source_title,
-                        target_id=target_id,
-                        target_title=target_title,
-                        msg_id=lead_id,
-                        item_count=max(1, total_media),
-                        mode=mode,
-                        status="error",
-                        delivery_key=delivery_key, rule_id=rule.id, album_group_id=group_id,
-                        preview=clean_preview,
-                        detail=str(exc),
-                    )
-                    last_ok, last_msg = False, str(exc)
-                if self.manager.cfg.delay_seconds > 0:
-                    await asyncio.sleep(self.manager.cfg.delay_seconds)
-            return last_ok, last_msg
+                    if used_relay:
+                        used_relay_any = True
+                    parts = {pending[idx][1] for idx in sent_indexes}
+                    if caption_sent:
+                        parts.add("caption")
+                    self.manager.dedup.mark_delivery_parts(key, parts)
+                    delivered.update(parts)
+                    if len(sent_indexes) != len(pending):
+                        raise RuntimeError(f"评论组发送不完整：本次确认发送 {len(sent_indexes)}/{len(pending)} 项")
+                self.manager.dedup.mark_many(
+                    source_id, {lead_id, *(msg.id for msg in main_msgs)}, target_id, account_id=self.account_id,
+                )
+                cmt_note = f"含评论区媒体 {sum(len(b) for b in comment_batches)} 项（{len(chunks)} 组）" if comment_batches else ""
+                relay_note = "复用首目标媒体" if used_relay_any else ""
+                detail_txt = " · ".join(p for p in [detail_prefix, cmt_note, relay_note] if p)
+                self.manager.history.record(
+                    account_id=self.account_id,
+                    account_name=self.account_name,
+                    rule_name=rule.name,
+                    source_id=source_id,
+                    source_title=source_title,
+                    target_id=target_id,
+                    target_title=target_title,
+                    msg_id=lead_id,
+                    item_count=max(1, total_media),
+                    mode=mode,
+                    status="success",
+                    delivery_key=delivery_key, rule_id=rule.id, album_group_id=group_id,
+                    preview=clean_preview,
+                    detail=detail_txt,
+                )
+                log.info(
+                    "[%s/%s] Forwarded post %s (+%d comment items in %d chunks, %s -> %s, mode=%s)",
+                    self.account_name,
+                    rule.name,
+                    lead_id,
+                    sum(len(b) for b in comment_batches),
+                    len(chunks),
+                    source_id,
+                    target_id,
+                    mode,
+                )
+                last_ok, last_msg = True, mode
+            except Exception as exc:
+                log.exception("[%s/%s] Failed post+comments %s -> %s: %s", self.account_name, rule.name, lead_id, target_id, exc)
+                self.manager.history.record(
+                    account_id=self.account_id,
+                    account_name=self.account_name,
+                    rule_name=rule.name,
+                    source_id=source_id,
+                    source_title=source_title,
+                    target_id=target_id,
+                    target_title=target_title,
+                    msg_id=lead_id,
+                    item_count=max(1, total_media),
+                    mode=mode,
+                    status="error",
+                    delivery_key=delivery_key, rule_id=rule.id, album_group_id=group_id,
+                    preview=clean_preview,
+                    detail=str(exc),
+                )
+                last_ok, last_msg = False, str(exc)
+            finally:
+                inflight.discard(inflight_key)
+        return last_ok, last_msg
 
     async def _deliver_comment_chunk(
         self,
@@ -1312,35 +1773,117 @@ class AccountRunner:
         caption: str,
         entities: Optional[list[Any]],
         rule: CompiledRule,
-    ) -> tuple[set[int], bool]:
+        *,
+        source_id: int = 0,
+        target_id: int = 0,
+        main_objects: Optional[set[int]] = None,
+        lock_send: bool = False,
+        sleep_after: float = 0.0,
+    ) -> tuple[set[int], bool, bool]:
         if not self._is_noforwards(chat, chunk):
             try:
-                if len(chunk) == 1:
-                    result = await self._call_with_flood_retry(
-                        lambda: self.client.send_file(target, chunk[0].media, caption=caption, formatting_entities=entities)
-                    )
-                    indexes = {0} if result is not None else set()
-                else:
-                    result = await self._call_with_flood_retry(
+                async def _do_direct_chunk() -> Any:
+                    if len(chunk) == 1:
+                        return await self._call_with_flood_retry(
+                            lambda: self.client.send_file(target, chunk[0].media, caption=caption, formatting_entities=entities)
+                        )
+                    return await self._call_with_flood_retry(
                         lambda: self.client.send_file(
                             target, [msg.media for msg in chunk],
                             caption=[caption] + [""] * (len(chunk) - 1),
                             formatting_entities=[entities or []] + [[] for _ in chunk[1:]],
                         )
                     )
+
+                if lock_send:
+                    async with self._send_lock:
+                        result = await _do_direct_chunk()
+                        if result is not None and sleep_after > 0:
+                            await asyncio.sleep(sleep_after)
+                else:
+                    result = await _do_direct_chunk()
+                if len(chunk) == 1:
+                    indexes = {0} if result is not None else set()
+                else:
                     indexes = {idx for idx, (_, msg) in enumerate(zip(chunk, result or [])) if msg is not None}
-                return indexes, bool(caption and 0 in indexes)
+                return indexes, bool(caption and 0 in indexes), False
             except ChatForwardsRestrictedError:
                 pass
         if not rule.fallback_reupload:
             raise ValueError("源频道禁止转发且未启用重传")
-        if len(chunk) == 1:
-            uploaded = await self._reupload_single(target, chunk[0], caption, entities, rule)
-            return ({0} if uploaded else set()), bool(caption and uploaded)
-        sent = await self._reupload_album(
-            target, chunk, [caption] + [""] * (len(chunk) - 1), [entities or []] + [[] for _ in chunk[1:]],
-        )
-        return sent, bool(caption and sent)
+
+        chunk_items = [
+            ("main" if (main_objects is None or id(m) in main_objects) else "reply", int(m.id))
+            for m in chunk
+        ]
+        if source_id and target_id:
+            await self._wait_inflight_relays(source_id, chunk_items)
+            relays = self._lookup_relays(source_id, chunk_items, target_id)
+            if len(chunk) == 1:
+                relay = relays.get(chunk_items[0])
+                if relay is not None:
+                    relayed_mode, _ = await self._relay_single_from_target(
+                        source_id,
+                        chunk_items[0][0],
+                        chunk_items[0][1],
+                        relay,
+                        target,
+                        caption,
+                        entities,
+                        clear_caption=not bool(caption),
+                        lock_send=lock_send,
+                        sleep_after=sleep_after,
+                    )
+                    if relayed_mode is not None:
+                        return {0}, bool(caption), True
+            else:
+                relayed_mode, relayed_indexes = await self._relay_album_from_target(
+                    source_id,
+                    chunk_items,
+                    relays,
+                    target,
+                    [caption] + [""] * (len(chunk) - 1),
+                    [entities or []] + [[] for _ in chunk[1:]],
+                    clear_caption=not bool(caption),
+                    lock_send=lock_send,
+                    sleep_after=sleep_after,
+                )
+                if relayed_mode is not None:
+                    return relayed_indexes, bool(caption and 0 in relayed_indexes), True
+
+        claimed = self._claim_inflight_relays(source_id, chunk_items) if (source_id and target_id) else []
+        try:
+            if len(chunk) == 1:
+                uploaded, sent_msg = await self._reupload_single(
+                    target, chunk[0], caption, entities, rule, lock_send=lock_send, sleep_after=sleep_after
+                )
+                if uploaded and sent_msg is not None and source_id and target_id:
+                    cap_t, ents_t = truncate_text_with_entities(caption, entities, 1024)
+                    self._save_relays(
+                        source_id,
+                        [(chunk_items[0][0], chunk_items[0][1], target_id, sent_msg, cap_t, ents_t)],
+                    )
+                return ({0} if uploaded else set()), bool(caption and uploaded), False
+            sent_map = await self._reupload_album(
+                target,
+                chunk,
+                [caption] + [""] * (len(chunk) - 1),
+                [entities or []] + [[] for _ in chunk[1:]],
+                lock_send=lock_send,
+                sleep_after=sleep_after,
+            )
+            if sent_map and source_id and target_id:
+                self._save_relays(
+                    source_id,
+                    [
+                        (chunk_items[idx][0], chunk_items[idx][1], target_id, sent_msg, cap_used, ents_used)
+                        for idx, (sent_msg, cap_used, ents_used) in sent_map.items()
+                    ],
+                )
+            sent_indexes = set(sent_map.keys())
+            return sent_indexes, bool(caption and sent_indexes), False
+        finally:
+            self._release_inflight_relays(claimed)
 
     async def _deliver_single_to_target(
         self,
@@ -1465,30 +2008,94 @@ class AccountRunner:
                         detail="源频道禁止转发且未启用重传",
                     )
                     return False, "源频道禁止转发且未启用重传"
-                mode = "reupload"
-                uploaded = await self._reupload_single(
-                    target_ent, msg, cleaned_text, cleaned_entities, rule, lock_send=lock_send
-                )
-                if not uploaded:
-                    self.manager.history.record(
-                        account_id=self.account_id,
-                        account_name=self.account_name,
-                        rule_name=rule.name,
-                        source_id=source_id,
-                        source_title=source_title,
-                        target_id=target_id,
-                        target_title=target_title,
-                        msg_id=msg.id,
-                        item_count=1,
-                        mode="skip_size",
-                        status="skipped",
-                        preview=cleaned_text or "[媒体消息]",
-                        detail="超出最大下载大小或下载为空",
+                delay_s = self.manager.cfg.delay_seconds if lock_send else 0.0
+                if has_real_media:
+                    relayed_mode = None
+                    await self._wait_inflight_relays(source_id, [("main", msg.id)])
+                    relays = self._lookup_relays(source_id, [("main", msg.id)], target_id)
+                    relay = relays.get(("main", msg.id))
+                    if relay is not None:
+                        relayed_mode, _ = await self._relay_single_from_target(
+                            source_id,
+                            "main",
+                            msg.id,
+                            relay,
+                            target_ent,
+                            cleaned_text,
+                            cleaned_entities,
+                            clear_caption,
+                            lock_send=lock_send,
+                            sleep_after=delay_s,
+                        )
+                    if relayed_mode is not None:
+                        mode = relayed_mode
+                        detail_note = " · ".join(p for p in [detail_note, "复用首目标媒体"] if p)
+                    else:
+                        claimed = self._claim_inflight_relays(source_id, [("main", msg.id)])
+                        try:
+                            mode = "reupload"
+                            uploaded, sent_msg = await self._reupload_single(
+                                target_ent,
+                                msg,
+                                cleaned_text,
+                                cleaned_entities,
+                                rule,
+                                lock_send=lock_send,
+                                sleep_after=delay_s,
+                            )
+                            if not uploaded:
+                                self.manager.history.record(
+                                    account_id=self.account_id,
+                                    account_name=self.account_name,
+                                    rule_name=rule.name,
+                                    source_id=source_id,
+                                    source_title=source_title,
+                                    target_id=target_id,
+                                    target_title=target_title,
+                                    msg_id=msg.id,
+                                    item_count=1,
+                                    mode="skip_size",
+                                    status="skipped",
+                                    preview=cleaned_text or "[媒体消息]",
+                                    detail="超出最大下载大小或下载为空",
+                                )
+                                return False, "超出最大下载大小或下载为空"
+                            if sent_msg is not None:
+                                cap_t, ents_t = truncate_text_with_entities(cleaned_text, cleaned_entities, 1024)
+                                self._save_relays(
+                                    source_id,
+                                    [("main", msg.id, target_id, sent_msg, cap_t, ents_t)],
+                                )
+                        finally:
+                            self._release_inflight_relays(claimed)
+                else:
+                    mode = "reupload"
+                    uploaded, _ = await self._reupload_single(
+                        target_ent,
+                        msg,
+                        cleaned_text,
+                        cleaned_entities,
+                        rule,
+                        lock_send=lock_send,
+                        sleep_after=delay_s,
                     )
-                    return False, "超出最大下载大小或下载为空"
-                if lock_send and self.manager.cfg.delay_seconds > 0:
-                    async with self._send_lock:
-                        await asyncio.sleep(self.manager.cfg.delay_seconds)
+                    if not uploaded:
+                        self.manager.history.record(
+                            account_id=self.account_id,
+                            account_name=self.account_name,
+                            rule_name=rule.name,
+                            source_id=source_id,
+                            source_title=source_title,
+                            target_id=target_id,
+                            target_title=target_title,
+                            msg_id=msg.id,
+                            item_count=1,
+                            mode="skip_size",
+                            status="skipped",
+                            preview=cleaned_text or "[媒体消息]",
+                            detail="超出最大下载大小或下载为空",
+                        )
+                        return False, "超出最大下载大小或下载为空"
 
             self.manager.dedup.mark(source_id, msg.id, target_id, account_id=self.account_id)
             self.manager.history.record(
@@ -1657,14 +2264,48 @@ class AccountRunner:
                         detail="源频道禁止转发且未启用重传",
                     )
                     return False, "源频道禁止转发且未启用重传"
-                mode = "reupload"
-                sent_indexes = await self._reupload_album(
-                    target_ent, msgs, captions, entities_list, lock_send=lock_send
+                delay_s = self.manager.cfg.delay_seconds if lock_send else 0.0
+                item_keys = [("main", m.id) for m in msgs]
+                await self._wait_inflight_relays(source_id, item_keys)
+                relays = self._lookup_relays(source_id, item_keys, target_id)
+                relayed_mode, relayed_indexes = await self._relay_album_from_target(
+                    source_id,
+                    item_keys,
+                    relays,
+                    target_ent,
+                    captions,
+                    entities_list,
+                    clear_caption,
+                    lock_send=lock_send,
+                    sleep_after=delay_s,
                 )
-                sent_ids = {msgs[idx].id for idx in sent_indexes}
-                if lock_send and sent_ids and self.manager.cfg.delay_seconds > 0:
-                    async with self._send_lock:
-                        await asyncio.sleep(self.manager.cfg.delay_seconds)
+                if relayed_mode is not None:
+                    mode = relayed_mode
+                    sent_ids = {msgs[idx].id for idx in relayed_indexes}
+                    detail_note = " · ".join(p for p in [detail_note, "复用首目标媒体"] if p)
+                else:
+                    claimed = self._claim_inflight_relays(source_id, item_keys)
+                    try:
+                        mode = "reupload"
+                        sent_map = await self._reupload_album(
+                            target_ent,
+                            msgs,
+                            captions,
+                            entities_list,
+                            lock_send=lock_send,
+                            sleep_after=delay_s,
+                        )
+                        sent_ids = {msgs[idx].id for idx in sent_map}
+                        if sent_map:
+                            self._save_relays(
+                                source_id,
+                                [
+                                    ("main", msgs[idx].id, target_id, sent_msg, cap_used, ents_used)
+                                    for idx, (sent_msg, cap_used, ents_used) in sent_map.items()
+                                ],
+                            )
+                    finally:
+                        self._release_inflight_relays(claimed)
 
             self.manager.dedup.mark_delivery_parts(key, (f"main:{msg_id}" for msg_id in sent_ids))
             if len(sent_ids) != len(msgs):

@@ -8,7 +8,7 @@ from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp.test_utils import TestClient, TestServer
-from telethon.errors import AuthKeyUnregisteredError, RPCError
+from telethon.errors import AuthKeyUnregisteredError, ChatForwardsRestrictedError, MsgIdInvalidError, RPCError
 from telethon.tl.types import InputPeerChannel, MessageMediaPhoto
 from common import AuthStore, DedupStore, HistoryStore, compile_rule_dict, load_config, load_raw_config
 from forwarder import AccountRunner
@@ -618,6 +618,169 @@ class Audit(unittest.IsolatedAsyncioTestCase):
         gamma = next(x for x in load_raw_config(cfg)['rules'] if x['name'] == 'Gamma')
         self.assertTrue(gamma.get('enabled', True), 'stale index for Beta disabled Gamma')
         self.assertFalse(load_raw_config(cfg)['rules'][0]['enabled'])
+
+    async def test_restricted_single_reuploads_once_and_relays_to_second_target_and_comment_rule(self):
+        r = self.runner
+        target2, target2_peer = -1000000000013, InputPeerChannel(13, 1)
+        target3, target3_peer = -1000000000014, InputPeerChannel(14, 1)
+        r.target_cache.update({target2: target2_peer, target3: target3_peer})
+        r.target_noforwards = {TARGET: False, target2: False, target3: False}
+        restricted_chat = NS(broadcast=True, noforwards=True)
+        src_msg = post(10, 'caption', MessageMediaPhoto())
+        uploaded_media = MessageMediaPhoto()
+        r.client.download_media = AsyncMock(return_value='dummy.jpg')
+        r.client.send_file = AsyncMock(return_value=NS(id=501, media=uploaded_media))
+        r.client.forward_messages = AsyncMock(side_effect=[post(601), post(701)])
+
+        rule_multi = rule(targets=[TARGET, target2])
+        await r._process_single_message(restricted_chat, SOURCE, src_msg, [rule_multi])
+
+        rule_cmt = rule(targets=[target3], collect_comments=True)
+        r.source_map = {SOURCE: [rule_multi, rule_cmt]}
+        r.manager.cfg.rules = [rule_multi, rule_cmt]
+        ok, _ = await r._process_with_comments(restricted_chat, SOURCE, 'source', [src_msg], rule_cmt, skip_wait=True)
+
+        self.assertTrue(ok)
+        self.assertEqual(r.client.download_media.await_count, 1)
+        self.assertEqual(r.client.send_file.await_count, 1)
+        self.assertEqual(r.client.forward_messages.await_count, 2)
+        self.assertEqual(r.client.forward_messages.await_args_list[0].args[:3], (target2_peer, 501, TARGET_PEER))
+        self.assertEqual(r.client.forward_messages.await_args_list[1].args[:3], (target3_peer, 501, TARGET_PEER))
+        self.assertTrue(all(call.kwargs.get('drop_author') is True for call in r.client.forward_messages.await_args_list))
+        for tgt in (TARGET, target2, target3):
+            self.assertTrue(r.manager.dedup.seen(SOURCE, 10, tgt))
+
+    async def test_restricted_relay_with_different_caption_uses_send_file_without_redownload(self):
+        r = self.runner
+        target2, target2_peer = -1000000000013, InputPeerChannel(13, 1)
+        r.target_cache[target2] = target2_peer
+        r.target_noforwards = {TARGET: False, target2: False}
+        restricted_chat = NS(broadcast=True, noforwards=True)
+        src_msg = post(10, 'raw caption', MessageMediaPhoto())
+        uploaded_media = MessageMediaPhoto()
+        r.client.download_media = AsyncMock(return_value='dummy.jpg')
+        r.client.send_file = AsyncMock(side_effect=[NS(id=501, media=uploaded_media), NS(id=601, media=uploaded_media)])
+        r.client.forward_messages = AsyncMock()
+
+        rule1 = rule(targets=[TARGET])
+        rule2 = rule(targets=[target2], strip_patterns=['raw '])
+        await r._process_single_message(restricted_chat, SOURCE, src_msg, [rule1, rule2])
+
+        self.assertEqual(r.client.download_media.await_count, 1)
+        r.client.forward_messages.assert_not_awaited()
+        self.assertEqual(r.client.send_file.await_count, 2)
+        second_call = r.client.send_file.await_args_list[1]
+        self.assertIs(second_call.args[1], uploaded_media)
+        self.assertEqual(second_call.kwargs['caption'], 'caption')
+
+    async def test_restricted_relay_falls_back_to_reupload_if_first_target_restricted_or_deleted(self):
+        r = self.runner
+        target2, target2_peer = -1000000000013, InputPeerChannel(13, 1)
+        r.target_cache[target2] = target2_peer
+        r.target_noforwards = {TARGET: False, target2: False}
+        restricted_chat = NS(broadcast=True, noforwards=True)
+        src_msg = post(10, 'caption', MessageMediaPhoto())
+        uploaded_media = MessageMediaPhoto()
+        r.client.download_media = AsyncMock(return_value='dummy.jpg')
+        r.client.send_file = AsyncMock(side_effect=[NS(id=501, media=uploaded_media), NS(id=601, media=uploaded_media)])
+        r.client.forward_messages = AsyncMock(side_effect=ChatForwardsRestrictedError(request=None))
+
+        await r._process_single_message(restricted_chat, SOURCE, src_msg, [rule(targets=[TARGET, target2])])
+
+        self.assertTrue(r.target_noforwards[TARGET])
+        self.assertEqual(r.client.download_media.await_count, 2)
+        self.assertEqual(r.client.send_file.await_count, 2)
+        self.assertEqual(r.manager.dedup.get_reupload_relays(SOURCE, [('main', 10)]), {('main', 10): {
+            'item_kind': 'main', 'item_id': 10, 'relay_chat_id': target2, 'relay_msg_id': 601,
+            'caption_text': 'caption', 'entities_sig': '',
+            'created_at': r.manager.dedup.get_reupload_relays(SOURCE, [('main', 10)])[('main', 10)]['created_at'],
+        }})
+
+    async def test_restricted_album_reuploads_once_and_relays_to_second_target(self):
+        r = self.runner
+        target2, target2_peer = -1000000000013, InputPeerChannel(13, 1)
+        r.target_cache[target2] = target2_peer
+        r.target_noforwards = {TARGET: False, target2: False}
+        restricted_chat = NS(broadcast=True, noforwards=True)
+        msgs = [post(11, 'album cap', MessageMediaPhoto()), post(12, '', MessageMediaPhoto())]
+        m1, m2 = MessageMediaPhoto(), MessageMediaPhoto()
+        r.client.download_media = AsyncMock(side_effect=['a.jpg', 'b.jpg'])
+        r.client.send_file = AsyncMock(return_value=[NS(id=511, media=m1), NS(id=512, media=m2)])
+        r.client.forward_messages = AsyncMock(return_value=[post(611), post(612)])
+
+        await r._process_album_messages(restricted_chat, SOURCE, msgs, recovering_rules=[rule(targets=[TARGET, target2])])
+
+        self.assertEqual(r.client.download_media.await_count, 2)
+        self.assertEqual(r.client.send_file.await_count, 1)
+        r.client.forward_messages.assert_awaited_once()
+        self.assertEqual(r.client.forward_messages.await_args.args[:3], (target2_peer, [511, 512], TARGET_PEER))
+        for tgt in (TARGET, target2):
+            self.assertTrue(r.manager.dedup.seen(SOURCE, 11, tgt))
+            self.assertTrue(r.manager.dedup.seen(SOURCE, 12, tgt))
+
+    async def test_concurrent_restricted_reupload_coalesces_inflight_and_relays(self):
+        r = self.runner
+        target2, target2_peer = -1000000000013, InputPeerChannel(13, 1)
+        r.target_cache[target2] = target2_peer
+        r.target_noforwards = {TARGET: False, target2: False}
+        restricted_chat = NS(broadcast=True, noforwards=True)
+        src_msg = post(20, 'hello', MessageMediaPhoto())
+        dl_started, dl_release = asyncio.Event(), asyncio.Event()
+
+        async def slow_dl(_msg, file=None, **_kw):
+            dl_started.set()
+            await dl_release.wait()
+            return 'dummy.jpg'
+
+        r.client.download_media = AsyncMock(side_effect=slow_dl)
+        r.client.send_file = AsyncMock(return_value=NS(id=520, media=MessageMediaPhoto()))
+        r.client.forward_messages = AsyncMock(return_value=post(620))
+
+        t1 = asyncio.create_task(r._process_single_message(restricted_chat, SOURCE, src_msg, [rule(targets=[TARGET])]))
+        await asyncio.wait_for(dl_started.wait(), 2)
+        t2 = asyncio.create_task(r._process_single_message(restricted_chat, SOURCE, src_msg, [rule(targets=[target2])]))
+        await asyncio.sleep(0)
+        dl_release.set()
+        await asyncio.wait_for(asyncio.gather(t1, t2), 2)
+
+        self.assertEqual(r.client.download_media.await_count, 1)
+        self.assertEqual(r.client.send_file.await_count, 1)
+        r.client.forward_messages.assert_awaited_once()
+        self.assertEqual(r.client.forward_messages.await_args.args[:3], (target2_peer, 520, TARGET_PEER))
+
+    async def test_slow_comment_reupload_does_not_block_fast_copy_on_send_lock(self):
+        r = self.runner
+        dl_started, dl_release = asyncio.Event(), asyncio.Event()
+        settings = rule(collect_comments=True)
+        r.source_map = {SOURCE: [settings]}
+        r.manager.cfg.rules = [settings]
+        r.client.forward_messages.return_value = post(99)
+        r.client.send_file.return_value = NS(id=100, media=MessageMediaPhoto())
+
+        async def slow_download(_msg, file=None, **_kw):
+            dl_started.set()
+            await dl_release.wait()
+            return 'dummy-video.mp4'
+
+        r.client.download_media = AsyncMock(side_effect=slow_download)
+
+        restricted_chat = NS(broadcast=True, noforwards=True)
+        slow_task = asyncio.create_task(
+            r._process_with_comments(
+                restricted_chat, SOURCE, 'source', [post(10, 'vid', MessageMediaPhoto())], settings, skip_wait=True
+            )
+        )
+        await asyncio.wait_for(dl_started.wait(), 2)
+
+        await asyncio.wait_for(
+            r._process_single_message(CHAT, SOURCE, post(11, 'fast', MessageMediaPhoto()), [rule()]),
+            timeout=1.0,
+        )
+        r.client.forward_messages.assert_awaited_once()
+        dl_release.set()
+        ok, _ = await asyncio.wait_for(slow_task, 2)
+        self.assertTrue(ok)
+        r.client.send_file.assert_awaited_once()
 
 
 if __name__ == '__main__':
